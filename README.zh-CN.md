@@ -7,15 +7,15 @@
 ## 效果预览
 
 ```text
-agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (183K/1M) │ 5h: ◉◉◉◉○ 79% (284K tok · ↺1h20m) │ Wk: ◉◉◉◉○ 73% (284K tok · ↺5d7h)
-[Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 99%
+agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (183K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (284K tok · 1h20m) │ Wk: ◉◉◉◉○ 73% (284K tok · 5d7h)
+[Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF
 ```
 
 ## 核心特性
 
 - **双行信息看板 + 窄窗口自适应**：
-  - **第一行**：项目目录与 Git 状态（分支名、远程同步 `↑`/`↓`、未提交变更明细 `+staged ~modified ?untracked` 或 `✓`）、Context 占用（`已用/总量`）、5h 窗口余量 / Token 消耗 / 重置倒计时 / 快速消耗预警（`⚡快`）、周配额余量 / Token 消耗 / 重置倒计时。
-  - **第二行**：账号邮箱、订阅套餐、执行模式（`auto`/`plan`/`accept-edits`）、沙箱状态（`ON`/`OFF`）、Prompt Cache 命中率、完整模型名与思考强度（`Low`/`Medium`/`High`/`XHigh`/`Max`）。
+  - **第一行**：项目目录与 Git 状态（分支名、远程同步 `↑`/`↓`、未提交变更明细 `+staged ~modified ?untracked` 或 `✓`）、Context 占用（`已用/总量`）、Prompt Cache 命中率、5h 窗口余量 / Token 消耗 / 重置倒计时 / 快速消耗预警（`⚡快`）、周配额余量 / Token 消耗 / 重置倒计时。
+  - **第二行**：完整模型名与思考强度（`Low`/`Medium`/`High`/`XHigh`/`Max`）、账号邮箱、订阅套餐、执行模式（`auto`/`plan`/`accept-edits`）、沙箱状态（`ON`/`OFF`）。
   - 依据 `terminal_width` 自动裁剪次要字段，分屏变窄不折行。
 - **5 格靶心圆点进度条 + 三色预警**：
   - 默认采用高对比度靶心圆点（`◉`/`○`），消耗 `≤80%` 绿色、`>80%` 黄色、`>90%` 红色，圆点与百分比数字同色。

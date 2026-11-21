@@ -7,7 +7,7 @@
  *
  * Renders compact 2-line ANSI dashboard:
  *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ 5h: ◉◉◉◉○ 83% (238K tok · ↺3h18m) │ Wk: ◉◉◉◉○ 74% (238K tok · ↺5d9h)
- *   Line 2: User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 98% │ [Gemini 4 Neon · High]
+ *   Line 2: [Gemini 4 Neon · High] │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 98% │ User: user@example.com
  */
 
 import fs from 'node:fs';
@@ -929,12 +929,8 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
 
   // Assign priority (higher = kept longer on narrow terminals)
   const items = [];
-  if (account.user) {
-    items.push({
-      priority: 1,
-      text: `${ANSI.dim}User:${ANSI.reset} ${ANSI.bold}${account.user}${ANSI.reset}`,
-    });
-  }
+  if (modelBadge) items.push({ priority: 6, text: modelBadge });
+
   if (account.plan) {
     const planColor = colorByPlan(account.plan);
     items.push({
@@ -951,7 +947,12 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
   const cacheSeg = formatCacheSegment(payload);
   if (cacheSeg) items.push({ priority: 3, text: cacheSeg });
 
-  if (modelBadge) items.push({ priority: 6, text: modelBadge });
+  if (account.user) {
+    items.push({
+      priority: 1,
+      text: `${ANSI.dim}User:${ANSI.reset} ${ANSI.bold}${account.user}${ANSI.reset}`,
+    });
+  }
 
   if (items.length === 0) return null;
 
@@ -1055,7 +1056,7 @@ async function main() {
 
   const lines = [line1];
 
-  // Line 2: User + Plan + Mode + Sandbox + Cache + [Model · Effort]
+  // Line 2: [Model · Effort] + Plan + Mode + Sandbox + Cache + User
   const line2 = buildLine2(payload, modelBadge, sep, maxWidth);
   if (line2) lines.push(line2);
 

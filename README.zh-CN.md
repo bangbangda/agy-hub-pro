@@ -8,7 +8,7 @@
 
 ```text
 agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (183K/1M) │ 5h: ◉◉◉◉○ 79% (284K tok · ↺1h20m) │ Wk: ◉◉◉◉○ 73% (284K tok · ↺5d7h)
-[Gemini 4 Neon · High] │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 99% │ User: user@example.com
+[Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 99%
 ```
 
 ## 核心特性

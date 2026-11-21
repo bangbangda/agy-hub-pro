@@ -481,6 +481,28 @@ function atomicWriteState(data) {
   }
 }
 
+function resolveWindow5hStartMs(liveQuota, state, now = Date.now()) {
+  let resetMs = null;
+  const rawTime = liveQuota?.reset5hTime ?? state?.quota?.reset5hTime ?? null;
+  if (typeof rawTime === 'string' && rawTime.trim()) {
+    const parsed = Date.parse(rawTime);
+    if (Number.isFinite(parsed)) resetMs = parsed;
+  } else if (typeof rawTime === 'number' && Number.isFinite(rawTime)) {
+    resetMs = rawTime > 1e12 ? rawTime : rawTime * 1000;
+  }
+  if (resetMs === null) {
+    const sec = liveQuota?.reset5hSec ?? null;
+    if (typeof sec === 'number' && Number.isFinite(sec) && sec > 0 && sec <= FIVE_HOURS_MS / 1000 + 300) {
+      resetMs = now + sec * 1000;
+    }
+  }
+  // Align 5h token tally to the active quota cycle (reset_time - 5h) when known
+  if (resetMs !== null && resetMs > now && resetMs - now <= FIVE_HOURS_MS + 300_000) {
+    return resetMs - FIVE_HOURS_MS;
+  }
+  return now - FIVE_HOURS_MS;
+}
+
 function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName) {
   const now = Date.now();
   const state = existing && typeof existing === 'object'
@@ -560,6 +582,10 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
       state.quota.source = 'agy-stdin';
       dirty = true;
     }
+    if (liveQuota.reset5hTime && state.quota.reset5hTime !== liveQuota.reset5hTime) {
+      state.quota.reset5hTime = liveQuota.reset5hTime;
+      dirty = true;
+    }
     if (liveQuota.reset5hSec !== null) state.quota.reset5hSec = liveQuota.reset5hSec;
   }
   if (liveQuota.remWk !== null) {
@@ -570,28 +596,41 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
       state.quota.source = 'agy-stdin';
       dirty = true;
     }
+    if (liveQuota.resetWkTime && state.quota.resetWeekTime !== liveQuota.resetWkTime) {
+      state.quota.resetWeekTime = liveQuota.resetWkTime;
+      dirty = true;
+    }
     if (liveQuota.resetWkSec !== null) state.quota.resetWeekSec = liveQuota.resetWkSec;
   }
 
-  // Recompute rolling 5h & calendar-week sums when ledger updated
-  if (dirty) {
-    const cutoff7d = now - SEVEN_DAYS_MS;
-    const cutoff5h = now - FIVE_HOURS_MS;
-    const weekStart = getWeekStartMs(now);
+  // Always recompute 5h (aligned to active quota cycle) & calendar-week sums in memory
+  const cutoff7d = now - SEVEN_DAYS_MS;
+  const cutoff5h = resolveWindow5hStartMs(liveQuota, state, now);
+  const weekStart = getWeekStartMs(now);
 
-    state.ledger = state.ledger.filter(
-      (e) => e && typeof e.ts === 'number' && e.ts >= cutoff7d && e.tokens > 0
-    );
+  const prevLen = state.ledger.length;
+  state.ledger = state.ledger.filter(
+    (e) => e && typeof e.ts === 'number' && e.ts >= cutoff7d && e.tokens > 0
+  );
+  if (state.ledger.length !== prevLen) dirty = true;
+
+  if (state.ledger.length > 0) {
     let t5h = 0;
     let tWk = 0;
     for (const e of state.ledger) {
       if (e.ts >= cutoff5h) t5h += e.tokens;
       if (e.ts >= weekStart) tWk += e.tokens;
     }
-    if (state.ledger.length > 0) {
-      state.usage.tokens5h = Math.round(t5h);
-      state.usage.tokensWeek = Math.round(tWk);
+    const next5h = Math.round(t5h);
+    const nextWk = Math.round(tWk);
+    if (state.usage.tokens5h !== next5h || state.usage.tokensWeek !== nextWk) {
+      state.usage.tokens5h = next5h;
+      state.usage.tokensWeek = nextWk;
+      dirty = true;
     }
+  }
+
+  if (dirty) {
     state.updatedAt = now;
     atomicWriteState(state);
   }
@@ -1011,8 +1050,9 @@ async function main() {
   const prefix5h = liveQuota.rem5h != null ? '' : stateEstimated ? '~' : '';
   const prefixWk = liveQuota.remWk != null ? '' : stateEstimated ? '~' : '';
 
-  const tok5h = Math.max(state?.usage?.tokens5h ?? 0, sessionTok);
-  const tokWk = Math.max(state?.usage?.tokensWeek ?? 0, sessionTok);
+  const hasLedger = Array.isArray(state?.ledger) && state.ledger.length > 0;
+  const tok5h = hasLedger ? (state?.usage?.tokens5h ?? 0) : sessionTok;
+  const tokWk = hasLedger ? (state?.usage?.tokensWeek ?? 0) : sessionTok;
 
   const color5h = colorByUsage(100 - rem5h);
   const colorWk = colorByUsage(100 - remWk);

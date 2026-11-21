@@ -7,7 +7,7 @@
  *
  * Renders compact 2-line ANSI dashboard:
  *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ 5h: ◉◉◉◉○ 83% (238K tok · ↺3h18m) │ Wk: ◉◉◉◉○ 74% (238K tok · ↺5d9h)
- *   Line 2: [Gemini 4 Neon · High] │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 98% │ User: user@example.com
+ *   Line 2: [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 98%
  */
 
 import fs from 'node:fs';
@@ -970,6 +970,13 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
   const items = [];
   if (modelBadge) items.push({ priority: 6, text: modelBadge });
 
+  if (account.user) {
+    items.push({
+      priority: 1,
+      text: `${ANSI.dim}User:${ANSI.reset} ${ANSI.bold}${account.user}${ANSI.reset}`,
+    });
+  }
+
   if (account.plan) {
     const planColor = colorByPlan(account.plan);
     items.push({
@@ -985,13 +992,6 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
 
   const cacheSeg = formatCacheSegment(payload);
   if (cacheSeg) items.push({ priority: 3, text: cacheSeg });
-
-  if (account.user) {
-    items.push({
-      priority: 1,
-      text: `${ANSI.dim}User:${ANSI.reset} ${ANSI.bold}${account.user}${ANSI.reset}`,
-    });
-  }
 
   if (items.length === 0) return null;
 
@@ -1018,7 +1018,7 @@ async function main() {
   const maxWidth = resolveTerminalWidth(payload);
   const sep = ` ${ANSI.dim}│${ANSI.reset} `;
 
-  // Model Name + Reasoning Effort badge (placed at end of Line 2)
+  // Model Name + Reasoning Effort badge (placed at start of Line 2)
   const modelInfo = extractModelInfo(payload);
   const modelBadge = modelInfo.effort
     ? `${ANSI.bold}${ANSI.cyan}[${modelInfo.name}${ANSI.reset} ${ANSI.dim}·${ANSI.reset} ${ANSI.bold}${modelInfo.effort.color}${modelInfo.effort.label}${ANSI.reset}${ANSI.bold}${ANSI.cyan}]${ANSI.reset}`
@@ -1096,7 +1096,7 @@ async function main() {
 
   const lines = [line1];
 
-  // Line 2: [Model · Effort] + Plan + Mode + Sandbox + Cache + User
+  // Line 2: [Model · Effort] + User + Plan + Mode + Sandbox + Cache
   const line2 = buildLine2(payload, modelBadge, sep, maxWidth);
   if (line2) lines.push(line2);
 

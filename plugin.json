@@ -1,0 +1,8 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "agy-hud-pro",
+  "displayName": "AGY HUD Pro",
+  "version": "0.1.0",
+  "description": "Lightweight millisecond StatusLine & lifecycle hooks plugin for Antigravity CLI (agy) tracking model context, 5h/weekly quota & token ledger, and Git status.",
+  "author": "horace"
+}

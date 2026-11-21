@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# agy-hud-pro / install.sh
+#
+# 一键权限设置、配置合并安装（带自动备份）与全链路模拟测试脚本
+# 用法:
+#   ./install.sh --test       # 仅赋予可执行权限并运行全链路模拟测试（不修改真实 settings.json）
+#   ./install.sh --preview    # 预览将写入 settings.json 与 hooks.json 的配置内容
+#   ./install.sh --install    # 备份原配置并写入 ~/.gemini/antigravity-cli/settings.json + 安装插件/钩子
+#   ./install.sh              # 默认执行 --test 并展示安装指引
+# ==============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATUSLINE_SCRIPT="${SCRIPT_DIR}/statusline.mjs"
+COLLECTOR_SCRIPT="${SCRIPT_DIR}/collector.mjs"
+SETTINGS_FILE="${HOME}/.gemini/antigravity-cli/settings.json"
+SETTINGS_BACKUP="${HOME}/.gemini/antigravity-cli/settings.json.bak"
+GLOBAL_HOOKS_FILE="${HOME}/.gemini/config/hooks.json"
+GLOBAL_HOOKS_BACKUP="${HOME}/.gemini/config/hooks.json.bak"
+
+BOLD=$'\033[1m'
+CYAN=$'\033[36m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
+
+log_header() {
+  printf "\n${BOLD}${CYAN}▶ %s${RESET}\n" "$1"
+}
+
+log_ok() {
+  printf "${GREEN}✓${RESET} %s\n" "$1"
+}
+
+log_warn() {
+  printf "${YELLOW}!${RESET} %s\n" "$1"
+}
+
+ensure_executable() {
+  log_header "1. 赋予脚本可执行权限"
+  chmod +x "${STATUSLINE_SCRIPT}" "${COLLECTOR_SCRIPT}" "${SCRIPT_DIR}/install.sh"
+  log_ok "chmod +x: statusline.mjs, collector.mjs, install.sh"
+}
+
+preview_config() {
+  log_header "配置预览：~/.gemini/antigravity-cli/settings.json (statusLine 合并片段)"
+  cat <<EOF
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node ${STATUSLINE_SCRIPT}",
+    "enabled": true,
+    "padding": 0,
+    "stack_with_default": false
+  }
+}
+EOF
+
+  log_header "配置预览：插件根目录 hooks.json（或合并至 ~/.gemini/config/hooks.json）"
+  cat "${SCRIPT_DIR}/hooks.json"
+}
+
+install_config() {
+  ensure_executable
+
+  log_header "2. 备份并合并 ~/.gemini/antigravity-cli/settings.json"
+  mkdir -p "$(dirname "${SETTINGS_FILE}")"
+  if [[ -f "${SETTINGS_FILE}" ]]; then
+    cp "${SETTINGS_FILE}" "${SETTINGS_BACKUP}"
+    log_ok "已备份原配置至: ${SETTINGS_BACKUP}"
+  else
+    log_warn "未检测到已有 settings.json，将新建配置文件"
+  fi
+
+  node - "${SETTINGS_FILE}" "${STATUSLINE_SCRIPT}" <<'NODE_EOF'
+const fs = require('node:fs');
+const [settingsPath, statuslineScript] = process.argv.slice(2);
+let cfg = {};
+try {
+  cfg = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+} catch {
+  cfg = {};
+}
+cfg.statusLine = {
+  type: 'command',
+  command: `node ${statuslineScript}`,
+  enabled: true,
+  padding: 0,
+  stack_with_default: false,
+};
+fs.writeFileSync(settingsPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+NODE_EOF
+  log_ok "已写入 statusLine 配置至: ${SETTINGS_FILE}"
+
+  log_header "3. 注册生命周期钩子（优先 agy plugin install，否则合并至 ~/.gemini/config/hooks.json）"
+  if command -v agy >/dev/null 2>&1; then
+    echo "${DIM}运行: agy plugin install ${SCRIPT_DIR}${RESET}"
+    if agy plugin install "${SCRIPT_DIR}"; then
+      log_ok "已通过 agy plugin install 注册插件与生命周期钩子！"
+      return 0
+    else
+      log_warn "agy plugin install 返回非零退出码，回退至全局 ~/.gemini/config/hooks.json 合并写入..."
+    fi
+  else
+    log_warn "当前 PATH 未找到 agy 命令，直接合并写入全局 ~/.gemini/config/hooks.json..."
+  fi
+
+  mkdir -p "$(dirname "${GLOBAL_HOOKS_FILE}")"
+  if [[ -f "${GLOBAL_HOOKS_FILE}" ]]; then
+    cp "${GLOBAL_HOOKS_FILE}" "${GLOBAL_HOOKS_BACKUP}"
+    log_ok "已备份原 hooks.json 至: ${GLOBAL_HOOKS_BACKUP}"
+  fi
+
+  node - "${GLOBAL_HOOKS_FILE}" "${COLLECTOR_SCRIPT}" <<'NODE_EOF'
+const fs = require('node:fs');
+const [hooksPath, collectorScript] = process.argv.slice(2);
+let hooks = {};
+try {
+  hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+} catch {
+  hooks = {};
+}
+hooks['agy-hud-pro'] = {
+  enabled: true,
+  SessionStart: [
+    { type: 'command', command: `node ${collectorScript} --event SessionStart`, timeout: 5 }
+  ],
+  PreInvocation: [
+    { type: 'command', command: `node ${collectorScript} --event PreInvocation`, timeout: 5 }
+  ],
+  Stop: [
+    { type: 'command', command: `node ${collectorScript} --event Stop`, timeout: 5 }
+  ],
+};
+fs.writeFileSync(hooksPath, `${JSON.stringify(hooks, null, 2)}\n`, 'utf8');
+NODE_EOF
+  log_ok "已合并生命周期钩子至: ${GLOBAL_HOOKS_FILE}"
+}
+
+run_simulation_tests() {
+  ensure_executable
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d /tmp/agy-hud-pro-test.XXXXXX)"
+  trap "rm -rf '${tmp_dir}'" EXIT
+
+  local test_state="${tmp_dir}/state.json"
+  local test_lock="${tmp_dir}/collector.lock"
+  local test_stdin_dump="/tmp/agy-hud-last-stdin.json"
+  local mock_repo="${tmp_dir}/mock-repo"
+
+  # 准备一个临时 Git 仓库（带脏状态）用于演示 git:main* 与 git:feat/auth✓
+  mkdir -p "${mock_repo}"
+  git -C "${mock_repo}" init -q -b main
+  git -C "${mock_repo}" config user.email "hud@local"
+  git -C "${mock_repo}" config user.name "HUD"
+  printf "hello\n" > "${mock_repo}/README.md"
+  git -C "${mock_repo}" add README.md
+  git -C "${mock_repo}" commit -q -m "init"
+
+  log_header "2. 校验 Antigravity 插件结构 (agy plugin validate)"
+  if command -v agy >/dev/null 2>&1; then
+    agy plugin validate --strict "${SCRIPT_DIR}" && log_ok "agy plugin validate --strict 通过！" || log_warn "agy plugin validate 存在提示"
+  else
+    log_warn "未检测到 agy 命令，跳过 agy plugin validate"
+  fi
+
+  log_header "3. 模拟 SessionStart 钩子（清理过期锁 + 后台初始化）"
+  touch "${test_lock}"
+  local out_ss rc_ss
+  out_ss="$(printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","cwd":"%s"}\n' "${mock_repo}" \
+    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event SessionStart)"
+  rc_ss=$?
+  printf "  stdout : %s\n" "${out_ss}"
+  printf "  exit   : %d\n" "${rc_ss}"
+
+  log_header "4. 模拟 Stop 钩子（累加多轮本地 Token 账本：5h 与自然周统计）"
+  local out_stop rc_stop
+  out_stop="$(printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","terminationReason":"NO_TOOL_CALL","usage":{"input_tokens":850000,"output_tokens":350000}}\n' \
+    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event Stop)"
+  rc_stop=$?
+  printf "  stdout : %s\n" "${out_stop}"
+  printf "  exit   : %d\n" "${rc_stop}"
+
+  # 写入一条 2 天前的自然周记录（3.6M tok）+ 一条 9 天前的过期记录（应被自动清理）
+  node - "${test_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const stateFile = process.argv[2];
+const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+const now = Date.now();
+st.ledger.push({ ts: now - 2 * 24 * 3600 * 1000, tokens: 3_600_000, model: 'gemini-4-neon', conversationId: 'conv-old-week', source: 'mock' });
+st.ledger.push({ ts: now - 9 * 24 * 3600 * 1000, tokens: 9_999_999, model: 'gemini-4-neon', conversationId: 'conv-expired', source: 'mock-expired' });
+fs.writeFileSync(stateFile, JSON.stringify(st, null, 2));
+NODE_EOF
+
+  # 再触发一次 Stop 钩子让它自动清理 >7 天过期记录并重算（delta = 0 仅触发重算）
+  printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","terminationReason":"NO_TOOL_CALL"}\n' \
+    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" AGY_HUD_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
+
+  log_ok "已自动清理 >7 天过期记录，当前本地账本聚合："
+  node -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); console.log("  ledger entries:", s.ledger.length, "| 5h tokens:", s.usage.tokens5h, "| week tokens:", s.usage.tokensWeek, "| est 5h%:", s.quota.remaining5h, "| est wk%:", s.quota.remainingWeek);' "${test_state}"
+
+  log_header "5. 模拟 StatusLine 实时渲染（5圆点进度条：正常绿 ≤80% / 预警黄 >80% / 危急红 >90%）"
+
+  # 场景 A：正常绿色（已用 ≤80%）+ 脏工作区 git:main* + 实时 stdin 配额
+  printf "dirty\n" >> "${mock_repo}/README.md"
+  local rendered_a rc_a ms
+  local payload_a
+  payload_a="$(printf '{"model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":18.5,"current_usage":{"input_tokens":2000,"cache_read_input_tokens":98000}},"quota":{"gemini-5h":{"remaining_fraction":0.78,"reset_in_seconds":11880},"gemini-weekly":{"remaining_fraction":0.91,"reset_in_seconds":468000}},"workspace":{"current_dir":"%s"},"cycle_mode":"auto","sandbox":{"enabled":false},"plan_tier":"Google AI Pro","email":"user@example.com"}\n' "${mock_repo}")"
+  local t0 t1
+  t0="$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time*1000')"
+  rendered_a="$(printf '%s\n' "${payload_a}" \
+    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
+  rc_a=$?
+  t1="$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time*1000')"
+  ms=$((t1 - t0))
+  printf "  ${DIM}[场景 A - 正常绿色 (≤80%%) / 脏仓库 / 实测耗时 %dms / exit=%d]${RESET}\n" "${ms}" "${rc_a}"
+  printf "%s\n\n" "${rendered_a}" | sed 's/^/  /'
+
+  # 场景 B：黄色预警（消耗 >80%，即 Ctx>80%、5h/Wk余量<20%）+ 干净分支 git:feat/auth✓ + camelCase 嗅探
+  git -C "${mock_repo}" checkout -q -b feat/auth
+  git -C "${mock_repo}" checkout -q -- README.md
+  local rendered_b rc_b
+  rendered_b="$(printf '{"modelName":"gemini-4-neon","contextWindow":{"usedTokens":840000,"maxTokens":1000000},"quota":{"5h":{"remaining_percentage":18},"weekly":{"remaining_percentage":15}},"cwd":"%s"}\n' "${mock_repo}" \
+    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
+  rc_b=$?
+  printf "  ${DIM}[场景 B - 黄色预警 (>80%%) / 干净分支 / camelCase 嗅探 / exit=%d]${RESET}\n" "${rc_b}"
+  printf "%s\n\n" "${rendered_b}" | sed 's/^/  /'
+
+  # 场景 C：红色危急（消耗 >90%，即 Ctx>90%、5h/Wk余量<10%）+ 本地估算回退 (~前缀) + 非 Git 目录
+  node - "${test_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const stateFile = process.argv[2];
+const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+const now = Date.now();
+st.quota.isEstimated = true;
+st.quota.source = 'estimated';
+// 重置为精确的 >90% 消耗账本：5h 消耗 4.6M/5M (~8% 余量)，本周消耗 37.2M/40M (~7% 余量)
+st.ledger = [
+  { ts: now - 10 * 60 * 1000, tokens: 4_600_000, model: 'gemini-4-neon', conversationId: 'conv-heavy-5h', source: 'mock' },
+  { ts: now - 24 * 3600 * 1000, tokens: 32_600_000, model: 'gemini-4-neon', conversationId: 'conv-heavy-wk', source: 'mock' },
+];
+fs.writeFileSync(stateFile, JSON.stringify(st, null, 2));
+NODE_EOF
+  # 触发一次重算以更新估算配额缓存
+  printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon"}\n' \
+    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" AGY_HUD_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
+
+  local rendered_c rc_c
+  rendered_c="$(printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":92.5},"cwd":"/tmp"}\n' \
+    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
+  rc_c=$?
+  printf "  ${DIM}[场景 C - 红色危急 (>90%%) / 本地估算(~前缀) / 非 Git 优雅隐藏 / exit=%d]${RESET}\n" "${rc_c}"
+  printf "%s\n" "${rendered_c}" | sed 's/^/  /'
+
+  log_header "6. 模拟 PreInvocation / UserPromptSubmit 主动预警钩子（余量 < 15% 注入切换模型提醒）"
+  local out_warn rc_warn
+  out_warn="$(printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","lastUserInput":"重构整个后端模块"}\n' \
+    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event UserPromptSubmit)"
+  rc_warn=$?
+  printf "  exit   : %d\n" "${rc_warn}"
+  printf "  stdout : %s\n" "${out_warn}"
+
+  log_header "7. 验证字段嗅探文件 (/tmp/agy-hud-last-stdin.json)"
+  if [[ -f "${test_stdin_dump}" ]]; then
+    log_ok "已生成 ${test_stdin_dump}（前 8 行）："
+    head -n 8 "${test_stdin_dump}" | sed 's/^/  /'
+  fi
+
+  printf "\n${BOLD}${GREEN}✔ 全部模拟测试通过！${RESET}\n"
+}
+
+case "${1:-}" in
+  --test)
+    run_simulation_tests
+    ;;
+  --preview)
+    preview_config
+    ;;
+  --install)
+    install_config
+    ;;
+  "")
+    run_simulation_tests
+    preview_config
+    ;;
+  *)
+    echo "用法: $0 [--test | --preview | --install]"
+    exit 1
+    ;;
+esac

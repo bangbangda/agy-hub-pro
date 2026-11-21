@@ -1,0 +1,9 @@
+# Runtime state & lock files
+state.json
+collector.lock
+*.tmp
+*.bak
+
+# macOS / Editor
+.DS_Store
+node_modules/

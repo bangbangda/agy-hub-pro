@@ -446,8 +446,20 @@ function extractSessionTotalTokens(payload) {
 }
 
 // ---------------------------------------------------------------------------
-// State cache reader (pure local read, zero network)
+// State cache reader & live incremental ledger sync (pure local, zero network)
 // ---------------------------------------------------------------------------
+
+const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+function getWeekStartMs(nowMs = Date.now()) {
+  const d = new Date(nowMs);
+  const day = d.getDay();
+  const diffToMonday = day === 0 ? 6 : day - 1;
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - diffToMonday);
+  return d.getTime();
+}
 
 function readStateCache() {
   try {
@@ -456,6 +468,135 @@ function readStateCache() {
   } catch {
     return null;
   }
+}
+
+function atomicWriteState(data) {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    const tmp = `${STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, STATE_FILE);
+  } catch {
+    // Never break status line on write failure
+  }
+}
+
+function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName) {
+  const now = Date.now();
+  const state = existing && typeof existing === 'object'
+    ? existing
+    : {
+        version: 1,
+        updatedAt: now,
+        lastRefreshAt: 0,
+        quota: {
+          remaining5h: 100,
+          remainingWeek: 100,
+          reset5hSec: null,
+          resetWeekSec: null,
+          source: 'estimated',
+          isEstimated: true,
+          oauthDetected: false,
+        },
+        usage: {
+          tokens5h: 0,
+          tokensWeek: 0,
+          budget5h: 5_000_000,
+          budgetWeek: 40_000_000,
+        },
+        conversations: {},
+        ledger: [],
+      };
+
+  if (!state.quota) state.quota = {};
+  if (!state.usage) state.usage = { tokens5h: 0, tokensWeek: 0 };
+  if (!state.conversations) state.conversations = {};
+  if (!Array.isArray(state.ledger)) state.ledger = [];
+
+  let dirty = !existing && Boolean(payload.session_id || payload.conversation_id);
+
+  // 1. Live cross-session token ledger sync (no hook dependency required)
+  const sessionId = payload.conversation_id || payload.session_id || payload.conversationId || '';
+  if (sessionId && sessionTok > 0) {
+    const prevMeta = state.conversations[sessionId] || {};
+    const prevTotal = Number(prevMeta.lastSessionTokens ?? prevMeta.lastContextTokens ?? 0);
+    const delta = sessionTok > prevTotal ? sessionTok - prevTotal : 0;
+
+    if (delta > 0) {
+      const lastEntry = state.ledger[state.ledger.length - 1];
+      if (
+        lastEntry &&
+        lastEntry.conversationId === sessionId &&
+        now - lastEntry.ts < 60_000
+      ) {
+        lastEntry.tokens += delta;
+        lastEntry.ts = now;
+      } else {
+        state.ledger.push({
+          ts: now,
+          tokens: delta,
+          model: modelName || 'unknown',
+          conversationId: sessionId,
+          source: 'statusline-live',
+        });
+      }
+      state.conversations[sessionId] = {
+        ...prevMeta,
+        lastSessionTokens: sessionTok,
+        lastContextTokens: ctxUsedTokens,
+        model: modelName || prevMeta.model || 'unknown',
+        updatedAt: now,
+      };
+      dirty = true;
+    }
+  }
+
+  // 2. Keep cached quota synced with live stdin telemetry
+  if (liveQuota.rem5h !== null) {
+    const rounded5h = Math.round(liveQuota.rem5h * 10) / 10;
+    if (state.quota.isEstimated || Math.abs((state.quota.remaining5h ?? -1) - rounded5h) >= 0.5) {
+      state.quota.remaining5h = rounded5h;
+      state.quota.isEstimated = false;
+      state.quota.source = 'agy-stdin';
+      dirty = true;
+    }
+    if (liveQuota.reset5hSec !== null) state.quota.reset5hSec = liveQuota.reset5hSec;
+  }
+  if (liveQuota.remWk !== null) {
+    const roundedWk = Math.round(liveQuota.remWk * 10) / 10;
+    if (state.quota.isEstimated || Math.abs((state.quota.remainingWeek ?? -1) - roundedWk) >= 0.5) {
+      state.quota.remainingWeek = roundedWk;
+      state.quota.isEstimated = false;
+      state.quota.source = 'agy-stdin';
+      dirty = true;
+    }
+    if (liveQuota.resetWkSec !== null) state.quota.resetWeekSec = liveQuota.resetWkSec;
+  }
+
+  // Recompute rolling 5h & calendar-week sums when ledger updated
+  if (dirty) {
+    const cutoff7d = now - SEVEN_DAYS_MS;
+    const cutoff5h = now - FIVE_HOURS_MS;
+    const weekStart = getWeekStartMs(now);
+
+    state.ledger = state.ledger.filter(
+      (e) => e && typeof e.ts === 'number' && e.ts >= cutoff7d && e.tokens > 0
+    );
+    let t5h = 0;
+    let tWk = 0;
+    for (const e of state.ledger) {
+      if (e.ts >= cutoff5h) t5h += e.tokens;
+      if (e.ts >= weekStart) tWk += e.tokens;
+    }
+    if (state.ledger.length > 0) {
+      state.usage.tokens5h = Math.round(t5h);
+      state.usage.tokensWeek = Math.round(tWk);
+    }
+    state.updatedAt = now;
+    atomicWriteState(state);
+  }
+
+  return state;
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +974,7 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
 
 async function main() {
   const payload = await readAndSniffStdin();
-  const state = readStateCache();
+  const existingState = readStateCache();
   const maxWidth = resolveTerminalWidth(payload);
   const sep = ` ${ANSI.dim}│${ANSI.reset} `;
 
@@ -851,10 +992,7 @@ async function main() {
   const ctx = extractContextWindow(payload);
   const ctxColor = colorByUsage(ctx.usedPct);
   const ctxDots = renderDots(ctx.usedPct, ctxColor);
-  const over200k = Boolean(payload.exceeds_200k_tokens) || ctx.usedTokens >= 200_000;
-  const ctxDetail = over200k
-    ? `${formatCompactTokens(ctx.usedTokens)}/${formatWindowSize(ctx.maxTokens)} · ${ANSI.yellow}>200K${ANSI.reset}${ANSI.dim}`
-    : `${formatCompactTokens(ctx.usedTokens)}/${formatWindowSize(ctx.maxTokens)}`;
+  const ctxDetail = `${formatCompactTokens(ctx.usedTokens)}/${formatWindowSize(ctx.maxTokens)}`;
 
   const segCtx =
     `${ANSI.dim}Ctx:${ANSI.reset} ${ctxDots} ${ctxColor}${formatPct(ctx.usedPct, 1)}${ANSI.reset} ` +
@@ -863,6 +1001,8 @@ async function main() {
   // 2 & 3. 5h Window & Weekly Quota + Consumed Tokens + Reset Countdowns
   // Displayed as remaining %; color follows consumed % (100 - remaining): >80% yellow, >90% red
   const liveQuota = extractLiveQuotaFromStdin(payload);
+  const sessionTok = extractSessionTotalTokens(payload);
+  const state = syncLiveState(payload, existingState, liveQuota, sessionTok, ctx.usedTokens, modelInfo.name);
   const stateEstimated = state ? Boolean(state.quota?.isEstimated) : true;
 
   const rem5h = liveQuota.rem5h ?? state?.quota?.remaining5h ?? 100;
@@ -870,7 +1010,6 @@ async function main() {
   const prefix5h = liveQuota.rem5h != null ? '' : stateEstimated ? '~' : '';
   const prefixWk = liveQuota.remWk != null ? '' : stateEstimated ? '~' : '';
 
-  const sessionTok = extractSessionTotalTokens(payload);
   const tok5h = Math.max(state?.usage?.tokens5h ?? 0, sessionTok);
   const tokWk = Math.max(state?.usage?.tokensWeek ?? 0, sessionTok);
 

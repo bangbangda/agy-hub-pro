@@ -1,71 +1,76 @@
 # agy-hub-pro (AGY HUD Pro)
 
-轻量级、零外部 npm 依赖的 **Antigravity CLI (`agy`)** 双行底部状态栏（StatusLine）与生命周期钩子插件，基于 macOS 原生 Node.js ESM 构建，毫秒级同步渲染、输入零卡顿。
+**English** | [简体中文](./README.zh-CN.md)
 
-## 效果预览
+A lightweight, zero-dependency **Antigravity CLI (`agy`)** two-line StatusLine dashboard and lifecycle hooks plugin built with native Node.js ESM for millisecond startup and zero terminal input lag.
+
+## Preview
 
 ```text
 agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (183K/1M) │ 5h: ◉◉◉◉○ 79% (284K tok · ↺1h20m) │ Wk: ◉◉◉◉○ 73% (284K tok · ↺5d7h)
 User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 99% │ [Gemini 4 Neon · High]
 ```
 
-## 核心特性
+## Features
 
-- **双行信息看板 + 窄窗口自适应**：
-  - **第一行**：项目目录与 Git 状态（分支名、远程同步 `↑`/`↓`、未提交变更明细 `+staged ~modified ?untracked` 或 `✓`）、Context 占用与 `>200K` 提示、5h 窗口余量 / Token 消耗 / 重置倒计时 / 快速消耗预警（`⚡快`）、周配额余量 / Token 消耗 / 重置倒计时。
-  - **第二行**：账号邮箱、订阅套餐、执行模式（`auto`/`plan`/`accept-edits`）、沙箱状态（`ON`/`OFF`）、Prompt Cache 命中率、完整模型名与思考强度（`Low`/`Medium`/`High`/`XHigh`/`Max`）。
-  - 依据 `terminal_width` 自动裁剪次要字段，分屏变窄不折行。
-- **5 格靶心圆点进度条 + 三色预警**：
-  - 默认采用高对比度靶心圆点（`◉`/`○`），消耗 `≤80%` 绿色、`>80%` 黄色、`>90%` 红色，圆点与百分比数字同色。
-  - 内置 6 套样式，可通过环境变量 `AGY_HUD_DOT_STYLE` 随时切换：`bullseye`（默认）、`pill`（`▰▱`）、`small`（`•◦`）、`square`（`▪▫`）、`diamond`（`◆◇`）、`classic`（`●○`）。
-- **本地缓存 + 异步刷新 + 生命周期钩子**：
-  - `SessionStart`：清理过期锁文件并异步触发后台初始化。
-  - `Stop`：按 5 小时滑动窗口与自然周两个维度累加本地真实 Token 账本（自动清理 >7 天过期记录），节流异步刷新。
-  - `PreInvocation`（兼容 `UserPromptSubmit`）：当 5h 或周余量 `< 15%` 时注入系统提醒，建议切换至 `gemini-4-hydrogen`。
-  - 首次或调试运行时自动转储原始 `stdin` 至 `/tmp/agy-hud-last-stdin.json` 便于排查字段。
+- **Two-Line Telemetry Dashboard + Responsive Width Fitting**
+  - **Line 1**: Workspace name & Git status (branch, ahead/behind `↑`/`↓`, uncommitted breakdown `+staged ~modified ?untracked` or `✓`), context window usage (`used/max`), 5-hour rolling window quota & token ledger with reset countdown and fast-burn indicator (`⚡快`), and weekly quota & token ledger with reset countdown.
+  - **Line 2**: Account email, subscription plan tier, execution mode (`auto` / `plan` / `accept-edits`), sandbox status (`ON` / `OFF`), Prompt Cache hit rate, and full model name with reasoning effort (`Low` / `Medium` / `High` / `XHigh` / `Max`).
+  - Automatically adapts to `terminal_width` by trimming lower-priority fields so split panes never wrap awkwardly.
+- **5-Dot Bullseye Progress Indicators & Threshold Coloring**
+  - High-contrast bullseye dots (`◉`/`○`) by default: **Green** (`≤ 80%` consumed), **Yellow** (`> 80%` consumed), and **Red** (`> 90%` consumed), with synchronized colors for both dots and percentage figures.
+  - Ships with 6 built-in styles switchable via `AGY_HUD_DOT_STYLE`: `bullseye` (default), `pill` (`▰▱`), `small` (`•◦`), `square` (`▪▫`), `diamond` (`◆◇`), and `classic` (`●○`).
+- **Local Cache + Async Refresh + Lifecycle Hooks**
+  - **Auto-Synced Local Ledger**: Persists incremental token usage across sessions into local `state.json` (5-hour sliding window + calendar-week totals, auto-pruning entries older than 7 days), with atomic writes and zero external dependencies.
+  - **`SessionStart`**: Cleans stale lock files and triggers a detached background initialization.
+  - **`Stop`**: Accumulates per-turn token deltas and triggers a throttled background refresh.
+  - **`PreInvocation`** (compatible with `UserPromptSubmit`): Injects a concise warning recommending `gemini-4-hydrogen` when 5h or weekly remaining quota drops below `15%`.
+  - **Field Sniffing**: Dumps formatted `stdin` snapshots to `/tmp/agy-hud-last-stdin.json` for easy payload debugging.
 
-## 快速安装
+## Quick Start
 
 ```bash
-git clone https://github.com/<your-username>/agy-hub-pro.git ~/.gemini/plugins/agy-hud-pro
+git clone https://github.com/bangbangda/agy-hub-pro.git ~/.gemini/plugins/agy-hud-pro
 cd ~/.gemini/plugins/agy-hud-pro
 
-# 1. 运行模拟测试与插件结构校验（不修改真实 settings.json）
+# 1. Run built-in simulation tests & plugin validation (does not touch settings.json)
 ./install.sh --test
 
-# 2. 一键安装（自动备份原 settings.json 为 settings.json.bak，并注册 statusLine 与生命周期钩子）
+# 2. Install (backs up settings.json to settings.json.bak, configures statusLine & hooks)
 ./install.sh --install
 ```
 
-### 在当前 `agy` 会话中即时启用状态栏
+### Enable Instantly in Your Current `agy` Session
 
 ```text
 /statusline node ~/.gemini/plugins/agy-hud-pro/statusline.mjs
 ```
 
-### 底部悬浮固定（可选）
+### Pin Input & HUD to the Bottom (Optional)
 
-在 `agy` 中运行 `/settings` 将 **Alt Screen Mode** 设为 `always`（或在 `~/.gemini/antigravity-cli/settings.json` 中设置 `"altScreenMode": "always"`），输入框与双行 HUD 将始终固定悬浮在终端最底部。
+Run `/settings` inside `agy` and set **Alt Screen Mode** to `always` (or add `"altScreenMode": "always"` to `~/.gemini/antigravity-cli/settings.json`) to keep the prompt composer and two-line HUD pinned at the bottom of your terminal.
 
-## 环境变量配置
+## Environment Variables
 
-| 变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 | :--- | :--- | :--- |
-| `AGY_HUD_DOT_STYLE` | `bullseye` | 进度样式：`bullseye` / `pill` / `small` / `square` / `diamond` / `classic` |
-| `AGY_HUD_GIT_TIMEOUT_MS` | `150` | `git status` 超时阈值（毫秒），超时后自动回退读取 `.git/HEAD` |
-| `AGY_HUD_SHOW_NON_GIT` | `0` | 设为 `1` 时在非 Git 目录显示 `git:-` |
-| `AGY_HUD_WARN_THRESHOLD` | `15` | `PreInvocation` 主动配额预警阈值（%） |
-| `AGY_HUD_5H_BUDGET` | `5000000` | 无云端配额时的 5h 本地估算基准（tokens） |
-| `AGY_HUD_WEEK_BUDGET` | `40000000` | 无云端配额时的周本地估算基准（tokens） |
-| `NO_COLOR` | 未设置 | 设为任意非空值时禁用 ANSI 颜色输出 |
+| `AGY_HUD_DOT_STYLE` | `bullseye` | Progress glyph style: `bullseye` / `pill` / `small` / `square` / `diamond` / `classic` |
+| `AGY_HUD_GIT_TIMEOUT_MS` | `150` | Timeout in ms for `git status` (falls back to direct `.git/HEAD` read on timeout) |
+| `AGY_HUD_SHOW_NON_GIT` | `0` | Set to `1` to display `git:-` in non-Git directories |
+| `AGY_HUD_WARN_THRESHOLD` | `15` | Remaining quota % threshold for `PreInvocation` low-quota warnings |
+| `AGY_HUD_5H_BUDGET` | `5000000` | Fallback 5-hour token budget used for local estimation (`~` prefix) |
+| `AGY_HUD_WEEK_BUDGET` | `40000000` | Fallback weekly token budget used for local estimation (`~` prefix) |
+| `NO_COLOR` | unset | Set to any non-empty value to disable ANSI colors |
 
-## 项目结构
+## Project Structure
 
 ```text
 agy-hub-pro/
-├── plugin.json       # Antigravity 原生插件清单
-├── hooks.json        # 生命周期钩子配置 (SessionStart / PreInvocation / Stop)
-├── statusline.mjs    # 毫秒级双行 ANSI 状态栏渲染脚本
-├── collector.mjs     # 后台异步配额探测与本地 Token 账本维护脚本
-└── install.sh        # 一键权限设置、备份合并安装与全链路模拟测试脚本
+├── plugin.json       # Native Antigravity plugin manifest
+├── hooks.json        # Lifecycle hooks (SessionStart / PreInvocation / Stop)
+├── statusline.mjs    # Millisecond two-line ANSI StatusLine renderer
+├── collector.mjs     # Background quota prober & local token ledger maintainer
+├── install.sh        # Permissions, backup-and-merge installer & simulation test suite
+├── README.md         # English documentation
+└── README.zh-CN.md   # Chinese documentation
 ```

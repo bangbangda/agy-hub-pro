@@ -406,11 +406,15 @@ function extractTurnTokens(payload, state) {
     return { deltaTokens: Math.round(payload.deltaTokens), model, convId, source: 'hook-delta' };
   }
 
-  // 2. Compare cumulative context_window tokens from payload or /tmp/agy-hud-last-stdin.json
+  // 2. Compare cumulative session/context_window tokens from payload or /tmp/agy-hud-last-stdin.json
   const ctxObj = payload.context_window || payload.contextWindow || safeReadJson(LAST_STDIN_FILE)?.context_window || null;
   if (ctxObj && typeof ctxObj === 'object') {
-    let cumulative =
-      Number(ctxObj.used_tokens ?? ctxObj.usedTokens ?? ctxObj.total_input_tokens ?? 0);
+    const inTot = Number(ctxObj.total_input_tokens ?? ctxObj.totalInputTokens ?? 0);
+    const outTot = Number(ctxObj.total_output_tokens ?? ctxObj.totalOutputTokens ?? 0);
+    let cumulative = inTot + outTot;
+    if (!cumulative) {
+      cumulative = Number(ctxObj.used_tokens ?? ctxObj.usedTokens ?? 0);
+    }
     if (!cumulative) {
       const size = Number(ctxObj.context_window_size ?? ctxObj.max_tokens ?? ctxObj.maxTokens ?? 0);
       const pct = Number(ctxObj.used_percentage ?? ctxObj.usedPercentage ?? 0);
@@ -419,10 +423,13 @@ function extractTurnTokens(payload, state) {
       }
     }
     if (cumulative > 0) {
-      const prev = state.conversations[convId]?.lastContextTokens || 0;
+      const prevMeta = state.conversations[convId] || {};
+      const prev = Math.max(Number(prevMeta.lastSessionTokens || 0), Number(prevMeta.lastContextTokens || 0));
       const delta = cumulative >= prev ? cumulative - prev : cumulative;
       state.conversations[convId] = {
-        lastContextTokens: cumulative,
+        ...prevMeta,
+        lastSessionTokens: cumulative,
+        lastContextTokens: inTot || cumulative,
         model,
         updatedAt: Date.now(),
       };

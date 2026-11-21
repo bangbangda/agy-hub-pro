@@ -6,8 +6,8 @@
  * Zero external dependencies (macOS native Node.js ESM).
  *
  * Renders compact 2-line ANSI dashboard:
- *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ 5h: ◉◉◉◉○ 83% (238K tok · ↺3h18m) │ Wk: ◉◉◉◉○ 74% (238K tok · ↺5d9h)
- *   Line 2: [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ Cache: 98%
+ *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ Cache: 98% │ 5h: ◉◉◉◉○ 83% (238K tok · 3h18m) │ Wk: ◉◉◉◉○ 74% (238K tok · 5d9h)
+ *   Line 2: [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF
  */
 
 import fs from 'node:fs';
@@ -422,19 +422,19 @@ function formatResetCountdown(resetTime, resetSec) {
   }
 
   if (secLeft === null) return null;
-  if (secLeft < 60) return '↺<1m';
+  if (secLeft < 60) return '<1m';
 
   const totalMin = Math.round(secLeft / 60);
   const totalHours = Math.floor(totalMin / 60);
   if (totalHours >= 24) {
     const d = Math.floor(totalHours / 24);
     const h = totalHours % 24;
-    return h > 0 ? `↺${d}d${h}h` : `↺${d}d`;
+    return h > 0 ? `${d}d${h}h` : `${d}d`;
   }
 
   const m = totalMin % 60;
   const durStr = totalHours > 0 ? (m > 0 ? `${totalHours}h${m}m` : `${totalHours}h`) : `${m}m`;
-  return `↺${durStr}`;
+  return durStr;
 }
 
 function extractSessionTotalTokens(payload) {
@@ -990,9 +990,6 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
   const sandboxSeg = formatSandboxSegment(payload);
   if (sandboxSeg) items.push({ priority: 2, text: sandboxSeg });
 
-  const cacheSeg = formatCacheSegment(payload);
-  if (cacheSeg) items.push({ priority: 3, text: cacheSeg });
-
   if (items.length === 0) return null;
 
   // Trim lowest-priority segments only when exceeding terminal_width
@@ -1076,7 +1073,9 @@ async function main() {
     ? `${formatCompactTokens(tokWk)} tok · ${resetWkLabel}`
     : `${formatCompactTokens(tokWk)} tok`;
 
-  const makeLine1 = (compact) => {
+  const cacheSeg = formatCacheSegment(payload);
+
+  const makeLine1 = (compact, includeCache = true) => {
     const m5h = compact ? (reset5hLabel ? `${reset5hLabel}${paceTag}` : '') : meta5hFull;
     const mWk = compact ? (resetWkLabel || '') : metaWkFull;
     const s5h =
@@ -1085,18 +1084,25 @@ async function main() {
     const sWk =
       `${ANSI.dim}Wk:${ANSI.reset} ${dotsWk} ${colorWk}${prefixWk}${formatPct(remWk, 0)}${ANSI.reset}` +
       (mWk ? ` ${ANSI.dim}(${mWk})${ANSI.reset}` : '');
-    const segs = wsGitSeg ? [wsGitSeg, segCtx, s5h, sWk] : [segCtx, s5h, sWk];
+    const segs = [];
+    if (wsGitSeg) segs.push(wsGitSeg);
+    segs.push(segCtx);
+    if (includeCache && cacheSeg) segs.push(cacheSeg);
+    segs.push(s5h, sWk);
     return segs.join(sep);
   };
 
-  let line1 = makeLine1(false);
+  let line1 = makeLine1(false, true);
   if (visibleWidth(line1) > maxWidth) {
-    line1 = makeLine1(true);
+    line1 = makeLine1(true, true);
+  }
+  if (visibleWidth(line1) > maxWidth && cacheSeg) {
+    line1 = makeLine1(true, false);
   }
 
   const lines = [line1];
 
-  // Line 2: [Model · Effort] + User + Plan + Mode + Sandbox + Cache
+  // Line 2: [Model · Effort] + User + Plan + Mode + Sandbox
   const line2 = buildLine2(payload, modelBadge, sep, maxWidth);
   if (line2) lines.push(line2);
 

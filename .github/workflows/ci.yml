@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-test:
+    name: Validate & Simulation Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check executable permissions & clean repo hygiene
+        run: |
+          test -x statusline.mjs
+          test -x collector.mjs
+          test -x install.sh
+          test ! -f state.json
+          test ! -f collector.lock
+
+      - name: Check Node.js ESM syntax
+        run: |
+          node --check statusline.mjs
+          node --check collector.mjs
+
+      - name: Validate JSON configuration files
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            for (const f of ["plugin.json", "hooks.json"]) {
+              const data = JSON.parse(fs.readFileSync(f, "utf8"));
+              if (!data || typeof data !== "object") throw new Error(`Invalid JSON object in ${f}`);
+              console.log(`OK: ${f}`);
+            }
+          '
+
+      - name: Run full simulation test suite
+        run: ./install.sh --test

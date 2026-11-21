@@ -183,9 +183,24 @@ function loadState() {
   };
 }
 
+function resolveWindow5hStartMs(state, now = Date.now()) {
+  const rawTime = state?.quota?.reset5hTime ?? null;
+  let resetMs = null;
+  if (typeof rawTime === 'string' && rawTime.trim()) {
+    const parsed = Date.parse(rawTime);
+    if (Number.isFinite(parsed)) resetMs = parsed;
+  } else if (typeof rawTime === 'number' && Number.isFinite(rawTime)) {
+    resetMs = rawTime > 1e12 ? rawTime : rawTime * 1000;
+  }
+  if (resetMs !== null && resetMs > now && resetMs - now <= FIVE_HOURS_MS + 300_000) {
+    return resetMs - FIVE_HOURS_MS;
+  }
+  return now - FIVE_HOURS_MS;
+}
+
 function recomputeAggregates(state, now = Date.now()) {
   const cutoff7d = now - SEVEN_DAYS_MS;
-  const cutoff5h = now - FIVE_HOURS_MS;
+  const cutoff5h = resolveWindow5hStartMs(state, now);
   const weekStart = getWeekStartMs(now);
 
   // Prune ledger entries older than 7 days

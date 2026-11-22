@@ -451,6 +451,7 @@ function extractSessionTotalTokens(payload) {
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const WINDOW_DRIFT_TOLERANCE_MS = 5 * 60 * 1000;
 
 function getWeekStartMs(nowMs = Date.now()) {
   const d = new Date(nowMs);
@@ -459,6 +460,59 @@ function getWeekStartMs(nowMs = Date.now()) {
   d.setHours(0, 0, 0, 0);
   d.setDate(d.getDate() - diffToMonday);
   return d.getTime();
+}
+
+function parseResetTimeMs(rawTime) {
+  if (typeof rawTime === 'string' && rawTime.trim()) {
+    const parsed = Date.parse(rawTime);
+    if (Number.isFinite(parsed)) return parsed;
+  } else if (typeof rawTime === 'number' && Number.isFinite(rawTime)) {
+    return rawTime > 1e12 ? rawTime : rawTime * 1000;
+  }
+  return null;
+}
+
+function isValidFutureReset(resetMs, windowMs, now) {
+  return resetMs !== null && resetMs > now && resetMs - now <= windowMs + WINDOW_DRIFT_TOLERANCE_MS;
+}
+
+function resolveWindowStartMs({ liveTime, liveSec, cachedTime, windowMs, fallbackStartMs, now }) {
+  const liveMs = parseResetTimeMs(liveTime);
+  if (isValidFutureReset(liveMs, windowMs, now)) {
+    return liveMs - windowMs;
+  }
+  if (typeof liveSec === 'number' && Number.isFinite(liveSec) && liveSec > 0) {
+    const fromSecMs = now + liveSec * 1000;
+    if (isValidFutureReset(fromSecMs, windowMs, now)) {
+      return fromSecMs - windowMs;
+    }
+  }
+  const cachedMs = parseResetTimeMs(cachedTime);
+  if (isValidFutureReset(cachedMs, windowMs, now)) {
+    return cachedMs - windowMs;
+  }
+  return fallbackStartMs;
+}
+
+function syncCachedResetTime(quotaState, field, liveTime, liveSec, windowMs, now) {
+  if (liveTime) {
+    if (quotaState[field] !== liveTime) {
+      quotaState[field] = liveTime;
+      return true;
+    }
+    return false;
+  }
+  if (typeof liveSec === 'number' && Number.isFinite(liveSec) && liveSec > 0) {
+    const derivedMs = now + liveSec * 1000;
+    if (isValidFutureReset(derivedMs, windowMs, now)) {
+      const prevMs = parseResetTimeMs(quotaState[field]);
+      if (prevMs === null || prevMs <= now || Math.abs(derivedMs - prevMs) > 60_000) {
+        quotaState[field] = new Date(derivedMs).toISOString();
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function readStateCache() {
@@ -482,25 +536,28 @@ function atomicWriteState(data) {
 }
 
 function resolveWindow5hStartMs(liveQuota, state, now = Date.now()) {
-  let resetMs = null;
-  const rawTime = liveQuota?.reset5hTime ?? state?.quota?.reset5hTime ?? null;
-  if (typeof rawTime === 'string' && rawTime.trim()) {
-    const parsed = Date.parse(rawTime);
-    if (Number.isFinite(parsed)) resetMs = parsed;
-  } else if (typeof rawTime === 'number' && Number.isFinite(rawTime)) {
-    resetMs = rawTime > 1e12 ? rawTime : rawTime * 1000;
-  }
-  if (resetMs === null) {
-    const sec = liveQuota?.reset5hSec ?? null;
-    if (typeof sec === 'number' && Number.isFinite(sec) && sec > 0 && sec <= FIVE_HOURS_MS / 1000 + 300) {
-      resetMs = now + sec * 1000;
-    }
-  }
   // Align 5h token tally to the active quota cycle (reset_time - 5h) when known
-  if (resetMs !== null && resetMs > now && resetMs - now <= FIVE_HOURS_MS + 300_000) {
-    return resetMs - FIVE_HOURS_MS;
-  }
-  return now - FIVE_HOURS_MS;
+  return resolveWindowStartMs({
+    liveTime: liveQuota?.reset5hTime,
+    liveSec: liveQuota?.reset5hSec,
+    cachedTime: state?.quota?.reset5hTime,
+    windowMs: FIVE_HOURS_MS,
+    fallbackStartMs: now - FIVE_HOURS_MS,
+    now,
+  });
+}
+
+function resolveWindowWeekStartMs(liveQuota, state, now = Date.now()) {
+  // Align weekly token tally to the active cloud quota cycle (reset_time - 7d) when known,
+  // falling back to local calendar week (Monday 00:00) only when no reset anchor exists.
+  return resolveWindowStartMs({
+    liveTime: liveQuota?.resetWkTime,
+    liveSec: liveQuota?.resetWkSec,
+    cachedTime: state?.quota?.resetWeekTime,
+    windowMs: SEVEN_DAYS_MS,
+    fallbackStartMs: getWeekStartMs(now),
+    now,
+  });
 }
 
 function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName) {
@@ -516,6 +573,8 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
           remainingWeek: 100,
           reset5hSec: null,
           resetWeekSec: null,
+          reset5hTime: null,
+          resetWeekTime: null,
           source: 'estimated',
           isEstimated: true,
           oauthDetected: false,
@@ -582,8 +641,7 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
       state.quota.source = 'agy-stdin';
       dirty = true;
     }
-    if (liveQuota.reset5hTime && state.quota.reset5hTime !== liveQuota.reset5hTime) {
-      state.quota.reset5hTime = liveQuota.reset5hTime;
+    if (syncCachedResetTime(state.quota, 'reset5hTime', liveQuota.reset5hTime, liveQuota.reset5hSec, FIVE_HOURS_MS, now)) {
       dirty = true;
     }
     if (liveQuota.reset5hSec !== null) state.quota.reset5hSec = liveQuota.reset5hSec;
@@ -596,17 +654,16 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
       state.quota.source = 'agy-stdin';
       dirty = true;
     }
-    if (liveQuota.resetWkTime && state.quota.resetWeekTime !== liveQuota.resetWkTime) {
-      state.quota.resetWeekTime = liveQuota.resetWkTime;
+    if (syncCachedResetTime(state.quota, 'resetWeekTime', liveQuota.resetWkTime, liveQuota.resetWkSec, SEVEN_DAYS_MS, now)) {
       dirty = true;
     }
     if (liveQuota.resetWkSec !== null) state.quota.resetWeekSec = liveQuota.resetWkSec;
   }
 
-  // Always recompute 5h (aligned to active quota cycle) & calendar-week sums in memory
+  // Always recompute 5h & weekly sums aligned to their active cloud quota cycles
   const cutoff7d = now - SEVEN_DAYS_MS;
   const cutoff5h = resolveWindow5hStartMs(liveQuota, state, now);
-  const weekStart = getWeekStartMs(now);
+  const weekStart = resolveWindowWeekStartMs(liveQuota, state, now);
 
   const prevLen = state.ledger.length;
   state.ledger = state.ledger.filter(
@@ -614,7 +671,7 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
   );
   if (state.ledger.length !== prevLen) dirty = true;
 
-  if (state.ledger.length > 0) {
+  if (state.ledger.length > 0 || prevLen > 0) {
     let t5h = 0;
     let tWk = 0;
     for (const e of state.ledger) {
@@ -1056,15 +1113,24 @@ async function main() {
   const dots5h = renderDots(rem5h, color5h);
   const dotsWk = renderDots(remWk, colorWk);
 
-  const reset5hSec = liveQuota.reset5hSec ?? state?.quota?.reset5hSec ?? null;
-  const reset5hLabel = formatResetCountdown(liveQuota.reset5hTime, reset5hSec);
-  const fastPace = isBurning5hFast(rem5h, reset5hSec);
+  const nowMs = Date.now();
+  const cached5hMs = parseResetTimeMs(state?.quota?.reset5hTime);
+  const cachedWkMs = parseResetTimeMs(state?.quota?.resetWeekTime);
+  const cached5hTime = cached5hMs !== null && cached5hMs > nowMs ? state.quota.reset5hTime : null;
+  const cachedWkTime = cachedWkMs !== null && cachedWkMs > nowMs ? state.quota.resetWeekTime : null;
+
+  const reset5hTime = liveQuota.reset5hTime ?? cached5hTime;
+  const reset5hSec = liveQuota.reset5hSec ?? (reset5hTime ? null : state?.quota?.reset5hSec ?? null);
+  const reset5hLabel = formatResetCountdown(reset5hTime, reset5hSec);
+  const fastPaceSec =
+    liveQuota.reset5hSec ??
+    (reset5hTime ? Math.max(0, Math.round((parseResetTimeMs(reset5hTime) - nowMs) / 1000)) : state?.quota?.reset5hSec ?? null);
+  const fastPace = isBurning5hFast(rem5h, fastPaceSec);
   const paceTag = fastPace ? ` ${ANSI.yellow}⚡快${ANSI.reset}${ANSI.dim}` : '';
 
-  const resetWkLabel = formatResetCountdown(
-    liveQuota.resetWkTime,
-    liveQuota.resetWkSec ?? state?.quota?.resetWeekSec ?? null
-  );
+  const resetWkTime = liveQuota.resetWkTime ?? cachedWkTime;
+  const resetWkSec = liveQuota.resetWkSec ?? (resetWkTime ? null : state?.quota?.resetWeekSec ?? null);
+  const resetWkLabel = formatResetCountdown(resetWkTime, resetWkSec);
 
   const meta5hFull = reset5hLabel
     ? `${formatCompactTokens(tok5h)} tok · ${reset5hLabel}${paceTag}`

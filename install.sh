@@ -263,7 +263,124 @@ NODE_EOF
   printf "  exit   : %d\n" "${rc_warn}"
   printf "  stdout : %s\n" "${out_warn}"
 
-  log_header "7. 验证字段嗅探文件 (/tmp/agy-hud-last-stdin.json)"
+  log_header "7. 验证周配额周期对齐 (reset_time - 7d / reset_in_seconds / 过期回退)"
+  local align_state="${tmp_dir}/state-align.json"
+  local align_lock="${tmp_dir}/collector-align.lock"
+  local align_reset_iso
+  align_reset_iso="$(node -e 'console.log(new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString())')"
+
+  # 写入跨重置周期账本：3 天前（上一周配额周期，应被排除）+ 1 天前（当前周配额周期，应被计入）
+  node - "${align_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const stateFile = process.argv[2];
+const now = Date.now();
+const st = {
+  version: 1,
+  updatedAt: now,
+  lastRefreshAt: 0,
+  quota: { remaining5h: 100, remainingWeek: 100, reset5hSec: null, resetWeekSec: null, reset5hTime: null, resetWeekTime: null, source: 'estimated', isEstimated: true, oauthDetected: false },
+  usage: { tokens5h: 0, tokensWeek: 0, budget5h: 5_000_000, budgetWeek: 40_000_000 },
+  conversations: {},
+  ledger: [
+    { ts: now - 3 * 24 * 3600 * 1000, tokens: 2_000_000, model: 'gemini-4-neon', conversationId: 'conv-prev-cycle', source: 'mock' },
+    { ts: now - 1 * 24 * 3600 * 1000, tokens: 500_000, model: 'gemini-4-neon', conversationId: 'conv-curr-cycle', source: 'mock' },
+  ],
+};
+fs.writeFileSync(stateFile, JSON.stringify(st, null, 2));
+NODE_EOF
+
+  # 7a. statusline.mjs 使用 reset_time (now + 5d => 当前周期起算于 now - 2d)，仅计入 500K tok
+  local rendered_align
+  rendered_align="$(printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":10},"quota":{"gemini-weekly":{"remaining_fraction":0.85,"reset_time":"%s"}},"cwd":"/tmp"}\n' "${align_reset_iso}" \
+    | NO_COLOR=1 AGY_HUD_STATE_FILE="${align_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/align-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${align_state}" "${align_reset_iso}" "${rendered_align}" <<'NODE_EOF'
+const fs = require('node:fs');
+const [stateFile, expectedReset, rendered] = process.argv.slice(2);
+const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+if (st.usage.tokensWeek !== 500_000) {
+  console.error(`FAIL 7a: expected tokensWeek=500000, got ${st.usage.tokensWeek}`);
+  process.exit(1);
+}
+if (st.quota.resetWeekTime !== expectedReset) {
+  console.error(`FAIL 7a: expected resetWeekTime=${expectedReset}, got ${st.quota.resetWeekTime}`);
+  process.exit(1);
+}
+if (!rendered.includes('500K tok')) {
+  console.error(`FAIL 7a: expected rendered output to include "500K tok", got:\n${rendered}`);
+  process.exit(1);
+}
+NODE_EOF
+
+  # 7b. collector.mjs Stop 钩子保持与 statusline 一致的周周期汇总
+  printf '{"conversationId":"conv-curr-cycle","modelName":"gemini-4-neon","terminationReason":"NO_TOOL_CALL"}\n' \
+    | AGY_HUD_STATE_FILE="${align_state}" AGY_HUD_LOCK_FILE="${align_lock}" AGY_HUD_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
+  node - "${align_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (st.usage.tokensWeek !== 500_000) {
+  console.error(`FAIL 7b: collector Stop expected tokensWeek=500000, got ${st.usage.tokensWeek}`);
+  process.exit(1);
+}
+NODE_EOF
+
+  # 7c. 仅提供 reset_in_seconds (6 天剩余 => 周期起算于 1 天前)，自动推导 resetWeekTime 并排除 4 天前记录
+  local align_sec_state="${tmp_dir}/state-align-sec.json"
+  node - "${align_sec_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const now = Date.now();
+const st = {
+  version: 1,
+  updatedAt: now,
+  lastRefreshAt: 0,
+  quota: { remaining5h: 100, remainingWeek: 100, reset5hSec: null, resetWeekSec: null, reset5hTime: null, resetWeekTime: null, source: 'estimated', isEstimated: true, oauthDetected: false },
+  usage: { tokens5h: 0, tokensWeek: 0, budget5h: 5_000_000, budgetWeek: 40_000_000 },
+  conversations: {},
+  ledger: [
+    { ts: now - 4 * 24 * 3600 * 1000, tokens: 1_500_000, model: 'gemini-4-neon', conversationId: 'conv-prev-sec', source: 'mock' },
+    { ts: now - 12 * 3600 * 1000, tokens: 300_000, model: 'gemini-4-neon', conversationId: 'conv-curr-sec', source: 'mock' },
+  ],
+};
+fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
+NODE_EOF
+  printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":10},"quota":{"gemini-weekly":{"remaining_fraction":0.9,"reset_in_seconds":518400}},"cwd":"/tmp"}\n' \
+    | NO_COLOR=1 AGY_HUD_STATE_FILE="${align_sec_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/align-sec-stdin.json" node "${STATUSLINE_SCRIPT}" >/dev/null
+  node - "${align_sec_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (st.usage.tokensWeek !== 300_000) {
+  console.error(`FAIL 7c: reset_in_seconds-only expected tokensWeek=300000, got ${st.usage.tokensWeek}`);
+  process.exit(1);
+}
+if (!st.quota.resetWeekTime || !Number.isFinite(Date.parse(st.quota.resetWeekTime))) {
+  console.error(`FAIL 7c: expected derived ISO resetWeekTime, got ${st.quota.resetWeekTime}`);
+  process.exit(1);
+}
+NODE_EOF
+
+  # 7d. 过期 resetWeekTime 且无实时重置时间时安全回退至本地自然周
+  node - "${align_sec_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const now = Date.now();
+const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+st.quota.resetWeekTime = new Date(now - 3600 * 1000).toISOString();
+st.ledger = [
+  { ts: now - 5 * 60 * 1000, tokens: 120_000, model: 'gemini-4-neon', conversationId: 'conv-fallback', source: 'mock' },
+];
+fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
+NODE_EOF
+  printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":10},"cwd":"/tmp"}\n' \
+    | NO_COLOR=1 AGY_HUD_STATE_FILE="${align_sec_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/align-fb-stdin.json" node "${STATUSLINE_SCRIPT}" >/dev/null
+  node - "${align_sec_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (st.usage.tokensWeek !== 120_000) {
+  console.error(`FAIL 7d: fallback expected tokensWeek=120000, got ${st.usage.tokensWeek}`);
+  process.exit(1);
+}
+NODE_EOF
+  log_ok "周配额周期对齐校验全部通过（reset_time / collector Stop / reset_in_seconds / 过期回退）"
+
+  log_header "8. 验证字段嗅探文件 (/tmp/agy-hud-last-stdin.json)"
   if [[ -f "${test_stdin_dump}" ]]; then
     log_ok "已生成 ${test_stdin_dump}（前 8 行）："
     head -n 8 "${test_stdin_dump}" | sed 's/^/  /'

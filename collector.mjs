@@ -27,6 +27,7 @@ const LAST_STDIN_FILE = process.env.AGY_HUD_LAST_STDIN || '/tmp/agy-hud-last-std
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const WINDOW_DRIFT_TOLERANCE_MS = 5 * 60 * 1000;
 const STALE_LOCK_MS = 30 * 1000;
 const MIN_REFRESH_INTERVAL_MS = 15 * 1000;
 const LOW_QUOTA_THRESHOLD = Number(process.env.AGY_HUD_WARN_THRESHOLD || 15);
@@ -150,6 +151,8 @@ function createDefaultState(now = Date.now()) {
       remainingWeek: 100,
       reset5hSec: null,
       resetWeekSec: null,
+      reset5hTime: null,
+      resetWeekTime: null,
       source: 'estimated',
       isEstimated: true,
       oauthDetected: false,
@@ -183,25 +186,66 @@ function loadState() {
   };
 }
 
-function resolveWindow5hStartMs(state, now = Date.now()) {
-  const rawTime = state?.quota?.reset5hTime ?? null;
-  let resetMs = null;
+function parseResetTimeMs(rawTime) {
   if (typeof rawTime === 'string' && rawTime.trim()) {
     const parsed = Date.parse(rawTime);
-    if (Number.isFinite(parsed)) resetMs = parsed;
+    if (Number.isFinite(parsed)) return parsed;
   } else if (typeof rawTime === 'number' && Number.isFinite(rawTime)) {
-    resetMs = rawTime > 1e12 ? rawTime : rawTime * 1000;
+    return rawTime > 1e12 ? rawTime : rawTime * 1000;
   }
-  if (resetMs !== null && resetMs > now && resetMs - now <= FIVE_HOURS_MS + 300_000) {
-    return resetMs - FIVE_HOURS_MS;
+  return null;
+}
+
+function isValidFutureReset(resetMs, windowMs, now) {
+  return resetMs !== null && resetMs > now && resetMs - now <= windowMs + WINDOW_DRIFT_TOLERANCE_MS;
+}
+
+function resolveWindowStartMs({ cachedTime, windowMs, fallbackStartMs, now }) {
+  const cachedMs = parseResetTimeMs(cachedTime);
+  if (isValidFutureReset(cachedMs, windowMs, now)) {
+    return cachedMs - windowMs;
   }
-  return now - FIVE_HOURS_MS;
+  return fallbackStartMs;
+}
+
+function syncCachedResetTime(quotaState, field, liveTime, liveSec, windowMs, now) {
+  if (liveTime) {
+    quotaState[field] = liveTime;
+    return;
+  }
+  if (typeof liveSec === 'number' && Number.isFinite(liveSec) && liveSec > 0) {
+    const derivedMs = now + liveSec * 1000;
+    if (isValidFutureReset(derivedMs, windowMs, now)) {
+      const prevMs = parseResetTimeMs(quotaState[field]);
+      if (prevMs === null || prevMs <= now || Math.abs(derivedMs - prevMs) > 60_000) {
+        quotaState[field] = new Date(derivedMs).toISOString();
+      }
+    }
+  }
+}
+
+function resolveWindow5hStartMs(state, now = Date.now()) {
+  return resolveWindowStartMs({
+    cachedTime: state?.quota?.reset5hTime,
+    windowMs: FIVE_HOURS_MS,
+    fallbackStartMs: now - FIVE_HOURS_MS,
+    now,
+  });
+}
+
+function resolveWindowWeekStartMs(state, now = Date.now()) {
+  return resolveWindowStartMs({
+    cachedTime: state?.quota?.resetWeekTime,
+    windowMs: SEVEN_DAYS_MS,
+    fallbackStartMs: getWeekStartMs(now),
+    now,
+  });
 }
 
 function recomputeAggregates(state, now = Date.now()) {
   const cutoff7d = now - SEVEN_DAYS_MS;
   const cutoff5h = resolveWindow5hStartMs(state, now);
-  const weekStart = getWeekStartMs(now);
+  const weekStart = resolveWindowWeekStartMs(state, now);
 
   // Prune ledger entries older than 7 days
   state.ledger = state.ledger.filter(
@@ -262,6 +306,8 @@ function extractQuotaFromObject(obj) {
   let remWk = null;
   let reset5hSec = null;
   let resetWeekSec = null;
+  let reset5hTime = null;
+  let resetWeekTime = null;
 
   const pickPct = (node) => {
     if (node == null) return null;
@@ -293,6 +339,7 @@ function extractQuotaFromObject(obj) {
       if (pct !== null) {
         rem5h = pct;
         reset5hSec = q[k]?.reset_in_seconds ?? q[k]?.resetInSeconds ?? null;
+        reset5hTime = q[k]?.reset_time ?? q[k]?.resetTime ?? null;
         break;
       }
     }
@@ -303,6 +350,7 @@ function extractQuotaFromObject(obj) {
       if (pct !== null) {
         remWk = pct;
         resetWeekSec = q[k]?.reset_in_seconds ?? q[k]?.resetInSeconds ?? null;
+        resetWeekTime = q[k]?.reset_time ?? q[k]?.resetTime ?? null;
         break;
       }
     }
@@ -317,12 +365,14 @@ function extractQuotaFromObject(obj) {
       if (pct !== null) {
         rem5h = pct;
         reset5hSec = val?.reset_in_seconds ?? val?.resetInSeconds ?? null;
+        reset5hTime = val?.reset_time ?? val?.resetTime ?? null;
       }
     } else if (remWk === null && (lk.includes('week') || lk.includes('7d') || lk.includes('wk'))) {
       const pct = pickPct(val);
       if (pct !== null) {
         remWk = pct;
         resetWeekSec = val?.reset_in_seconds ?? val?.resetInSeconds ?? null;
+        resetWeekTime = val?.reset_time ?? val?.resetTime ?? null;
       }
     }
   }
@@ -330,9 +380,11 @@ function extractQuotaFromObject(obj) {
   // Also check flat fields directly on quota object
   if (rem5h === null && typeof q.remaining5h === 'number') rem5h = clampPct(q.remaining5h);
   if (remWk === null && typeof q.remainingWeek === 'number') remWk = clampPct(q.remainingWeek);
+  if (reset5hTime === null) reset5hTime = q.reset5hTime ?? q.reset_5h_time ?? null;
+  if (resetWeekTime === null) resetWeekTime = q.resetWeekTime ?? q.reset_week_time ?? null;
 
   if (rem5h === null && remWk === null) return null;
-  return { remaining5h: rem5h, remainingWeek: remWk, reset5hSec, resetWeekSec };
+  return { remaining5h: rem5h, remainingWeek: remWk, reset5hSec, resetWeekSec, reset5hTime, resetWeekTime };
 }
 
 function probeLocalQuotaSources() {
@@ -385,7 +437,16 @@ function probeLocalQuotaSources() {
     }
   }
 
-  return { remaining5h: null, remainingWeek: null, reset5hSec: null, resetWeekSec: null, source: 'estimated', oauthDetected };
+  return {
+    remaining5h: null,
+    remainingWeek: null,
+    reset5hSec: null,
+    resetWeekSec: null,
+    reset5hTime: null,
+    resetWeekTime: null,
+    source: 'estimated',
+    oauthDetected,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +584,8 @@ function handleStop(payload) {
     if (payloadQuota.remainingWeek !== null) state.quota.remainingWeek = payloadQuota.remainingWeek;
     if (payloadQuota.reset5hSec !== null) state.quota.reset5hSec = payloadQuota.reset5hSec;
     if (payloadQuota.resetWeekSec !== null) state.quota.resetWeekSec = payloadQuota.resetWeekSec;
+    syncCachedResetTime(state.quota, 'reset5hTime', payloadQuota.reset5hTime, payloadQuota.reset5hSec, FIVE_HOURS_MS, now);
+    syncCachedResetTime(state.quota, 'resetWeekTime', payloadQuota.resetWeekTime, payloadQuota.resetWeekSec, SEVEN_DAYS_MS, now);
     state.quota.isEstimated = false;
     state.quota.source = 'hook-payload';
   }
@@ -611,6 +674,8 @@ function handleRefresh() {
       if (probed.remainingWeek !== null) state.quota.remainingWeek = probed.remainingWeek;
       if (probed.reset5hSec !== null) state.quota.reset5hSec = probed.reset5hSec;
       if (probed.resetWeekSec !== null) state.quota.resetWeekSec = probed.resetWeekSec;
+      syncCachedResetTime(state.quota, 'reset5hTime', probed.reset5hTime, probed.reset5hSec, FIVE_HOURS_MS, now);
+      syncCachedResetTime(state.quota, 'resetWeekTime', probed.resetWeekTime, probed.resetWeekSec, SEVEN_DAYS_MS, now);
       state.quota.source = probed.source;
       state.quota.isEstimated = false;
     } else if (state.quota.source === 'estimated') {

@@ -21,7 +21,7 @@ agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (183K/1M) │ Cache: 99
   - High-contrast bullseye dots (`◉`/`○`) by default: **Green** (`≤ 80%` consumed), **Yellow** (`> 80%` consumed), and **Red** (`> 90%` consumed), with synchronized colors for both dots and percentage figures.
   - Ships with 6 built-in styles switchable via `AGY_HUD_DOT_STYLE`: `bullseye` (default), `pill` (`▰▱`), `small` (`•◦`), `square` (`▪▫`), `diamond` (`◆◇`), and `classic` (`●○`).
 - **Local Cache + Async Refresh + Lifecycle Hooks**
-  - **Auto-Synced Local Ledger**: Persists incremental token usage across sessions into local `state.json` (5-hour sliding window + calendar-week totals, auto-pruning entries older than 7 days), with atomic writes and zero external dependencies.
+  - **Auto-Synced Local Ledger**: Persists incremental token usage across sessions into local `state.json` (aligned to active 5-hour and weekly quota reset cycles, falling back to rolling 5h / calendar week when reset times are unavailable, and auto-pruning entries older than 7 days), with atomic writes and zero external dependencies.
   - **`SessionStart`**: Cleans stale lock files and triggers a detached background initialization.
   - **`Stop`**: Accumulates per-turn token deltas and triggers a throttled background refresh.
   - **`PreInvocation`** (compatible with `UserPromptSubmit`): Injects a concise warning recommending `gemini-4-hydrogen` when 5h or weekly remaining quota drops below `15%`.

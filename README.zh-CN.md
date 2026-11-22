@@ -1,13 +1,21 @@
 # agy-hub-pro (AGY HUD Pro)
 
+[![Release](https://img.shields.io/github/v/release/bangbangda/agy-hub-pro?style=flat-square&color=blue)](https://github.com/bangbangda/agy-hub-pro/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/bangbangda/agy-hub-pro/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/bangbangda/agy-hub-pro/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)](#)
+[![Node.js ESM](https://img.shields.io/badge/node-ESM-339933?style=flat-square&logo=node.js&logoColor=white)](#)
+
 [English](./README.md) | **简体中文**
 
 轻量级、零外部 npm 依赖的 **Antigravity CLI (`agy`)** 双行底部状态栏（StatusLine）与生命周期钩子插件，基于 macOS 原生 Node.js ESM 构建，毫秒级同步渲染、输入零卡顿。
 
 ## 效果预览
 
+![AGY HUD Pro 终端渲染效果预览](./assets/preview.png)
+
 ```text
-agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (183K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (284K tok · 1h20m) │ Wk: ◉◉◉◉○ 73% (284K tok · 5d7h)
+agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (284K tok · 3h18m) │ Wk: ◉◉◉◉○ 73% (1.4M tok · 5d7h)
 [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF
 ```
 
@@ -71,6 +79,13 @@ agy-hub-pro/
 ├── statusline.mjs    # 毫秒级双行 ANSI 状态栏渲染脚本
 ├── collector.mjs     # 后台异步配额探测与本地 Token 账本维护脚本
 ├── install.sh        # 一键权限设置、备份合并安装与全链路模拟测试脚本
+├── assets/
+│   └── preview.png   # 终端双行状态栏渲染效果图
+├── LICENSE           # MIT 开源协议
 ├── README.md         # 英文文档
 └── README.zh-CN.md   # 中文文档
 ```
+
+## 开源协议
+
+本项目基于 [MIT License](./LICENSE) 开源。

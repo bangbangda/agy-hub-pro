@@ -1,13 +1,21 @@
 # agy-hub-pro (AGY HUD Pro)
 
+[![Release](https://img.shields.io/github/v/release/bangbangda/agy-hub-pro?style=flat-square&color=blue)](https://github.com/bangbangda/agy-hub-pro/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/bangbangda/agy-hub-pro/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/bangbangda/agy-hub-pro/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)](#)
+[![Node.js ESM](https://img.shields.io/badge/node-ESM-339933?style=flat-square&logo=node.js&logoColor=white)](#)
+
 **English** | [简体中文](./README.zh-CN.md)
 
 A lightweight, zero-dependency **Antigravity CLI (`agy`)** two-line StatusLine dashboard and lifecycle hooks plugin built with native Node.js ESM for millisecond startup and zero terminal input lag.
 
 ## Preview
 
+![AGY HUD Pro Terminal Preview](./assets/preview.png)
+
 ```text
-agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (183K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (284K tok · 1h20m) │ Wk: ◉◉◉◉○ 73% (284K tok · 5d7h)
+agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (284K tok · 3h18m) │ Wk: ◉◉◉◉○ 73% (1.4M tok · 5d7h)
 [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF
 ```
 
@@ -71,6 +79,13 @@ agy-hub-pro/
 ├── statusline.mjs    # Millisecond two-line ANSI StatusLine renderer
 ├── collector.mjs     # Background quota prober & local token ledger maintainer
 ├── install.sh        # Permissions, backup-and-merge installer & simulation test suite
+├── assets/
+│   └── preview.png   # Terminal statusline preview image
+├── LICENSE           # MIT License
 ├── README.md         # English documentation
 └── README.zh-CN.md   # Chinese documentation
 ```
+
+## License
+
+This project is licensed under the [MIT License](./LICENSE).

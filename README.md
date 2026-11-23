@@ -23,7 +23,7 @@ agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99
 
 - **Two-Line Telemetry Dashboard + Responsive Width Fitting**
   - **Line 1**: Workspace name & Git status (branch, ahead/behind `↑`/`↓`, uncommitted breakdown `+staged ~modified ?untracked` or `✓`), context window usage (`used/max`), Prompt Cache hit rate, 5-hour rolling window quota & token ledger with reset countdown and fast-burn indicator (`⚡快`), and weekly quota & token ledger with reset countdown.
-  - **Line 2**: Full model name with reasoning effort (`Low` / `Medium` / `High` / `XHigh` / `Max`), account email, subscription plan tier, execution mode (`auto` / `plan` / `accept-edits`), sandbox status (`ON` / `OFF`), and a live activity & throughput indicator while working (`● run_command 18s · ~56 t/s`, turning yellow after 60s without progress and collapsing to recent `~56 t/s` when idle).
+  - **Line 2**: Full model name with reasoning effort (`Low` / `Medium` / `High` / `XHigh` / `Max`), account email, subscription plan tier, execution mode (`auto` / `plan` / `accept-edits`), sandbox status (`ON` / `OFF`), and a live activity & throughput indicator (`● run_command 18s · ~56 t/s` while working, turning yellow after 60s without progress; `~56 t/s` stays visible for the full terminal window lifecycle including across `/clear`).
   - Automatically adapts to `terminal_width` by trimming lower-priority fields so split panes never wrap awkwardly.
 - **5-Dot Bullseye Progress Indicators & Threshold Coloring**
   - High-contrast bullseye dots (`◉`/`○`) by default: **Green** (`≤ 80%` consumed), **Yellow** (`> 80%` consumed), and **Red** (`> 90%` consumed), with synchronized colors for both dots and percentage figures.

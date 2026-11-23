@@ -380,7 +380,7 @@ if (st.usage.tokensWeek !== 120_000) {
 NODE_EOF
   log_ok "周配额周期对齐校验全部通过（reset_time / collector Stop / reset_in_seconds / 过期回退）"
 
-  log_header "8. 验证实时活跃状态、动作透出与吞吐速率 (working / tool / stall / idle / native t/s)"
+  log_header "8. 验证实时活跃状态、动作透出与吞吐速率 (working / tool / stall / idle / /clear / window isolation)"
   local act_state="${tmp_dir}/state-activity.json"
   local act_transcript="${tmp_dir}/transcript.jsonl"
   printf '{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"hello"}\n' > "${act_transcript}"
@@ -388,7 +388,7 @@ NODE_EOF
   # 8a. 进入 working 且刚发消息 -> 显示 "● 思考中"
   local rendered_act1
   rendered_act1="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1000},"agent_state":"working","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
-    | NO_COLOR=1 AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+    | NO_COLOR=1 AGY_HUD_WINDOW_ID="win-main" AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
   node - "${rendered_act1}" <<'NODE_EOF'
 const rendered = process.argv[2];
 if (!rendered.includes('● 思考中')) {
@@ -403,14 +403,15 @@ NODE_EOF
 const fs = require('node:fs');
 const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const t10 = Date.now() - 10_000;
-st.activity.workStartAt = t10;
-st.activity.lastOutAt = t10;
-st.activity.lastProgressAt = t10;
+const act = st.windowActivity['win-main'];
+act.workStartAt = t10;
+act.lastOutAt = t10;
+act.lastProgressAt = t10;
 fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
 NODE_EOF
   local rendered_act2
   rendered_act2="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1560},"agent_state":"working","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
-    | NO_COLOR=1 AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+    | NO_COLOR=1 AGY_HUD_WINDOW_ID="win-main" AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
   node - "${rendered_act2}" <<'NODE_EOF'
 const rendered = process.argv[2];
 if (!rendered.includes('● run_command 10s · ~56 t/s')) {
@@ -424,13 +425,14 @@ NODE_EOF
 const fs = require('node:fs');
 const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const t75 = Date.now() - 75_000;
-st.activity.workStartAt = t75;
-st.activity.lastProgressAt = t75;
+const act = st.windowActivity['win-main'];
+act.workStartAt = t75;
+act.lastProgressAt = t75;
 fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
 NODE_EOF
   local rendered_act3
   rendered_act3="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1560},"agent_state":"working","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
-    | AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+    | AGY_HUD_WINDOW_ID="win-main" AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
   node - "${rendered_act3}" <<'NODE_EOF'
 const rendered = process.argv[2];
 if (!rendered.includes('\x1b[33m●') || !rendered.includes('1m15s')) {
@@ -439,30 +441,78 @@ if (!rendered.includes('\x1b[33m●') || !rendered.includes('1m15s')) {
 }
 NODE_EOF
 
-  # 8d. 切回 idle -> 收起工作态动作，仅保留上轮估算速率 "~56 t/s"
+  # 8d. 切回 idle 且即使静置 2 小时后仍持续显示 "~56 t/s"（窗口生命周期内不过期）
+  node - "${act_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+st.windowActivity['win-main'].lastTpsAt = Date.now() - 2 * 3600 * 1000;
+fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
+NODE_EOF
   local rendered_act4
   rendered_act4="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1560},"agent_state":"idle","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
-    | NO_COLOR=1 AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+    | NO_COLOR=1 AGY_HUD_WINDOW_ID="win-main" AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
   node - "${rendered_act4}" <<'NODE_EOF'
 const rendered = process.argv[2];
 if (rendered.includes('●') || !rendered.includes('~56 t/s')) {
-  console.error(`FAIL 8d: expected idle "~56 t/s" without dot, got:\n${rendered}`);
+  console.error(`FAIL 8d: expected persistent idle "~56 t/s" without dot, got:\n${rendered}`);
   process.exit(1);
 }
 NODE_EOF
 
-  # 8e. 原生 tokens_per_second 字段优先直显（不带 ~ 前缀）
+  # 8e. 同一窗口开启新一轮 working -> 不清空历史速率，持续显示 "~56 t/s"
   local rendered_act5
-  rendered_act5="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":12},"agent_state":"idle","tokens_per_second":84,"cwd":"/tmp"}\n' \
-    | NO_COLOR=1 AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  rendered_act5="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1560},"agent_state":"working","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
+    | NO_COLOR=1 AGY_HUD_WINDOW_ID="win-main" AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
   node - "${rendered_act5}" <<'NODE_EOF'
 const rendered = process.argv[2];
-if (!rendered.includes('84 t/s') || rendered.includes('~84 t/s')) {
-  console.error(`FAIL 8e: expected native "84 t/s" without tilde, got:\n${rendered}`);
+if (!rendered.includes('~56 t/s')) {
+  console.error(`FAIL 8e: expected new working turn to preserve "~56 t/s", got:\n${rendered}`);
   process.exit(1);
 }
 NODE_EOF
-  log_ok "实时活跃状态、动作透出、卡顿提醒与 t/s 估算校验全部通过"
+
+  # 8f. 同一窗口执行 /clear（新 session_id + total_output_tokens=0）-> 速率不归零、不消失，且输出基线正确归零
+  local rendered_act6
+  rendered_act6="$(printf '{"session_id":"sess-after-clear","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":0,"total_output_tokens":0},"agent_state":"idle","cwd":"/tmp"}\n' \
+    | NO_COLOR=1 AGY_HUD_WINDOW_ID="win-main" AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${act_state}" "${rendered_act6}" <<'NODE_EOF'
+const fs = require('node:fs');
+const [stateFile, rendered] = process.argv.slice(2);
+const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+if (!rendered.includes('~56 t/s')) {
+  console.error(`FAIL 8f: expected /clear in same window to preserve "~56 t/s", got:\n${rendered}`);
+  process.exit(1);
+}
+if (st.windowActivity['win-main'].lastOutTokens !== 0) {
+  console.error(`FAIL 8f: expected lastOutTokens re-anchored to 0 after /clear, got ${st.windowActivity['win-main'].lastOutTokens}`);
+  process.exit(1);
+}
+NODE_EOF
+
+  # 8g. 新终端窗口隔离（不同 AGY_HUD_WINDOW_ID）-> 不继承旧窗口速率
+  local rendered_act7
+  rendered_act7="$(printf '{"session_id":"sess-other-win","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":5,"total_output_tokens":0},"agent_state":"idle","cwd":"/tmp"}\n' \
+    | NO_COLOR=1 AGY_HUD_WINDOW_ID="win-other" AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_act7}" <<'NODE_EOF'
+const rendered = process.argv[2];
+if (rendered.includes('t/s')) {
+  console.error(`FAIL 8g: expected new window not to inherit old window speed, got:\n${rendered}`);
+  process.exit(1);
+}
+NODE_EOF
+
+  # 8h. 原生 tokens_per_second 字段优先直显（不带 ~ 前缀）
+  local rendered_act8
+  rendered_act8="$(printf '{"session_id":"sess-after-clear","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":12},"agent_state":"idle","tokens_per_second":84,"cwd":"/tmp"}\n' \
+    | NO_COLOR=1 AGY_HUD_WINDOW_ID="win-main" AGY_HUD_STATE_FILE="${act_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_act8}" <<'NODE_EOF'
+const rendered = process.argv[2];
+if (!rendered.includes('84 t/s') || rendered.includes('~84 t/s')) {
+  console.error(`FAIL 8h: expected native "84 t/s" without tilde, got:\n${rendered}`);
+  process.exit(1);
+}
+NODE_EOF
+  log_ok "实时活跃状态、动作透出、卡顿提醒、/clear 保留与窗口级 t/s 隔离校验全部通过"
 
   log_header "9. 验证字段嗅探文件 (/tmp/agy-hud-last-stdin.json)"
   if [[ -f "${test_stdin_dump}" ]]; then

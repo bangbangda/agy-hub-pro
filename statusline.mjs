@@ -22,8 +22,8 @@ const STATE_FILE = process.env.AGY_HUD_STATE_FILE || path.join(PLUGIN_DIR, 'stat
 const LAST_STDIN_FILE = process.env.AGY_HUD_LAST_STDIN || '/tmp/agy-hud-last-stdin.json';
 const GIT_TIMEOUT_MS = Number(process.env.AGY_HUD_GIT_TIMEOUT_MS || 150);
 const STALL_WARN_MS = Math.max(5, Number(process.env.AGY_HUD_STALL_SEC || 60)) * 1000;
-const IDLE_SPEED_TTL_MS = 10 * 60 * 1000;
 const TRANSCRIPT_TAIL_BYTES = 16384;
+const MAX_TRACKED_WINDOWS = 16;
 
 const USE_COLOR = !process.env.NO_COLOR;
 const ANSI = {
@@ -596,14 +596,34 @@ function formatTokensPerSec(tps, isEstimated) {
   return `${isEstimated ? '~' : ''}${val} t/s`;
 }
 
+function resolveWindowId() {
+  const candidates = [
+    process.env.AGY_HUD_WINDOW_ID,
+    process.env.TMUX_PANE,
+    process.env.ITERM_SESSION_ID,
+    process.env.TERM_SESSION_ID,
+    process.env.WEZTERM_PANE,
+    process.env.KITTY_WINDOW_ID,
+    process.env.WT_SESSION,
+    process.env.ALACRITTY_WINDOW_ID,
+    process.env.VSCODE_PID,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  return '_default';
+}
+
 function formatActivitySegment(activity, isWorking, nativeTps, transcriptAction, now) {
   const isEstimated = nativeTps === null;
+  // Token throughput stays valid for the entire lifecycle of the current terminal window
+  // (persisted across turns, idle periods, and /clear).
   const activeTps =
     nativeTps !== null
       ? nativeTps
-      : activity?.lastTps != null &&
-          activity.lastTpsAt > 0 &&
-          (isWorking || now - activity.lastTpsAt <= IDLE_SPEED_TTL_MS)
+      : typeof activity?.lastTps === 'number' &&
+          Number.isFinite(activity.lastTps) &&
+          activity.lastTps > 0
         ? activity.lastTps
         : null;
   const tpsLabel = activeTps !== null ? formatTokensPerSec(activeTps, isEstimated) : '';
@@ -628,7 +648,7 @@ function formatActivitySegment(activity, isWorking, nativeTps, transcriptAction,
   }
 
   if (tpsLabel) {
-    return { priority: 1, text: `${ANSI.dim}${tpsLabel}${ANSI.reset}` };
+    return { priority: 3, text: `${ANSI.dim}${tpsLabel}${ANSI.reset}` };
   }
 
   return null;
@@ -749,35 +769,61 @@ function resolveWindowWeekStartMs(liveQuota, state, now = Date.now()) {
   });
 }
 
-function syncActivityState(state, payload, now, isWorking, outTok, nativeTps, transcriptAction) {
+function syncActivityState(state, payload, now, windowId, isWorking, outTok, nativeTps, transcriptAction) {
   const sessionId = payload.conversation_id || payload.session_id || payload.conversationId || '_default';
-  const prev = state.activity && typeof state.activity === 'object' ? state.activity : null;
+  if (!state.windowActivity || typeof state.windowActivity !== 'object') {
+    state.windowActivity = {};
+  }
+
+  let prev =
+    state.windowActivity[windowId] && typeof state.windowActivity[windowId] === 'object'
+      ? state.windowActivity[windowId]
+      : null;
+
+  // Backward compatibility: adopt legacy top-level state.activity when matching window or default
+  if (!prev && state.activity && typeof state.activity === 'object') {
+    const legacyWin = state.activity.windowId || '_default';
+    if (legacyWin === windowId) {
+      prev = state.activity;
+    }
+  }
+
+  const sameWindow = Boolean(prev);
   const sameSession = Boolean(prev && prev.sessionId === sessionId);
 
   let dirty = false;
+  const preservedTps =
+    sameWindow && typeof prev.lastTps === 'number' && Number.isFinite(prev.lastTps) && prev.lastTps > 0
+      ? prev.lastTps
+      : null;
+  const preservedTpsAt = preservedTps !== null ? (prev.lastTpsAt || 0) : 0;
+
   const act = sameSession
-    ? { ...prev }
+    ? { ...prev, windowId }
     : {
+        windowId,
         sessionId,
         isWorking: false,
         workStartAt: null,
         lastProgressAt: null,
         lastOutTokens: outTok,
         lastOutAt: now,
-        lastTps: null,
-        lastTpsAt: 0,
+        // Preserve last measured t/s across /clear or session switches within the same terminal window
+        lastTps: preservedTps,
+        lastTpsAt: preservedTpsAt,
         lastStepKey: null,
+        updatedAt: now,
       };
 
-  if (!sameSession && (isWorking || outTok > 0)) {
+  if (!sameSession && (isWorking || outTok > 0 || preservedTps !== null)) {
     dirty = true;
   }
 
   const wasWorking = Boolean(act.isWorking);
 
   // Detect output token growth -> estimate tokens/sec
-  if (outTok > 0 && act.lastOutTokens > 0 && outTok < act.lastOutTokens) {
-    // Session compacted or counter reset
+  if (act.lastOutTokens > 0 && outTok < act.lastOutTokens) {
+    // In-place /clear, session compaction, or counter reset: re-anchor baseline without resetting lastTps
     act.lastOutTokens = outTok;
     act.lastOutAt = now;
     dirty = true;
@@ -820,7 +866,7 @@ function syncActivityState(state, payload, now, isWorking, outTok, nativeTps, tr
     }
   }
 
-  // Handle working / idle transitions
+  // Handle working / idle transitions (never clear lastTps within the same window lifecycle)
   if (isWorking && !wasWorking) {
     act.isWorking = true;
     act.workStartAt = now;
@@ -828,11 +874,6 @@ function syncActivityState(state, payload, now, isWorking, outTok, nativeTps, tr
     if (act.lastOutAt !== now) {
       act.lastOutAt = now;
       act.lastOutTokens = outTok;
-    }
-    // Clear stale speed from a prior turn unless freshly computed on this tick
-    if (act.lastTpsAt !== now && nativeTps === null) {
-      act.lastTps = null;
-      act.lastTpsAt = 0;
     }
     act.lastStepKey = transcriptAction?.stepKey || null;
     dirty = true;
@@ -854,6 +895,23 @@ function syncActivityState(state, payload, now, isWorking, outTok, nativeTps, tr
     act.isWorking = false;
     act.workStartAt = null;
     act.lastStepKey = null;
+    dirty = true;
+  }
+
+  if (dirty) {
+    act.updatedAt = now;
+  }
+  state.windowActivity[windowId] = act;
+
+  // Keep windowActivity bounded so state.json stays compact across long-term use
+  const winKeys = Object.keys(state.windowActivity);
+  if (winKeys.length > MAX_TRACKED_WINDOWS) {
+    winKeys
+      .sort((a, b) => (state.windowActivity[b]?.updatedAt || 0) - (state.windowActivity[a]?.updatedAt || 0))
+      .slice(MAX_TRACKED_WINDOWS)
+      .forEach((k) => {
+        delete state.windowActivity[k];
+      });
     dirty = true;
   }
 
@@ -903,6 +961,7 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
       state,
       payload,
       now,
+      activityInput.windowId,
       activityInput.isWorking,
       activityInput.outTok,
       activityInput.nativeTps,
@@ -1413,11 +1472,13 @@ async function main() {
   // Displayed as remaining %; color follows consumed % (100 - remaining): >80% yellow, >90% red
   const liveQuota = extractLiveQuotaFromStdin(payload);
   const sessionTok = extractSessionTotalTokens(payload);
+  const windowId = resolveWindowId();
   const isWorking = extractAgentWorking(payload);
   const outTok = extractSessionOutputTokens(payload);
   const nativeTps = extractNativeTokensPerSec(payload);
   const transcriptAction = isWorking ? readLatestTranscriptAction(payload) : null;
   const state = syncLiveState(payload, existingState, liveQuota, sessionTok, ctx.usedTokens, modelInfo.name, {
+    windowId,
     isWorking,
     outTok,
     nativeTps,
@@ -1495,7 +1556,8 @@ async function main() {
   const lines = [line1];
 
   // Line 2: [Model · Effort] + User + Plan + Mode + Sandbox + Live Activity / Speed
-  const activityItem = formatActivitySegment(state?.activity, isWorking, nativeTps, transcriptAction, nowMs);
+  const windowActivity = state?.windowActivity?.[windowId] ?? state?.activity;
+  const activityItem = formatActivitySegment(windowActivity, isWorking, nativeTps, transcriptAction, nowMs);
   const line2 = buildLine2(payload, modelBadge, activityItem, sep, maxWidth);
   if (line2) lines.push(line2);
 

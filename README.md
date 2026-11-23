@@ -23,7 +23,7 @@ agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99
 
 - **Two-Line Telemetry Dashboard + Responsive Width Fitting**
   - **Line 1**: Workspace name & Git status (branch, ahead/behind `↑`/`↓`, uncommitted breakdown `+staged ~modified ?untracked` or `✓`), context window usage (`used/max`), Prompt Cache hit rate, 5-hour rolling window quota & token ledger with reset countdown and fast-burn indicator (`⚡快`), and weekly quota & token ledger with reset countdown.
-  - **Line 2**: Full model name with reasoning effort (`Low` / `Medium` / `High` / `XHigh` / `Max`), account email, subscription plan tier, execution mode (`auto` / `plan` / `accept-edits`), and sandbox status (`ON` / `OFF`).
+  - **Line 2**: Full model name with reasoning effort (`Low` / `Medium` / `High` / `XHigh` / `Max`), account email, subscription plan tier, execution mode (`auto` / `plan` / `accept-edits`), sandbox status (`ON` / `OFF`), and a live activity & throughput indicator while working (`● run_command 18s · ~56 t/s`, turning yellow after 60s without progress and collapsing to recent `~56 t/s` when idle).
   - Automatically adapts to `terminal_width` by trimming lower-priority fields so split panes never wrap awkwardly.
 - **5-Dot Bullseye Progress Indicators & Threshold Coloring**
   - High-contrast bullseye dots (`◉`/`○`) by default: **Green** (`≤ 80%` consumed), **Yellow** (`> 80%` consumed), and **Red** (`> 90%` consumed), with synchronized colors for both dots and percentage figures.
@@ -64,6 +64,7 @@ Run `/settings` inside `agy` and set **Alt Screen Mode** to `always` (or add `"a
 | :--- | :--- | :--- |
 | `AGY_HUD_DOT_STYLE` | `bullseye` | Progress glyph style: `bullseye` / `pill` / `small` / `square` / `diamond` / `classic` |
 | `AGY_HUD_GIT_TIMEOUT_MS` | `150` | Timeout in ms for `git status` (falls back to direct `.git/HEAD` read on timeout) |
+| `AGY_HUD_STALL_SEC` | `60` | Seconds without token or transcript step progress before the live activity indicator turns yellow |
 | `AGY_HUD_SHOW_NON_GIT` | `0` | Set to `1` to display `git:-` in non-Git directories |
 | `AGY_HUD_WARN_THRESHOLD` | `15` | Remaining quota % threshold for `PreInvocation` low-quota warnings |
 | `AGY_HUD_5H_BUDGET` | `5000000` | Fallback 5-hour token budget used for local estimation (`~` prefix) |

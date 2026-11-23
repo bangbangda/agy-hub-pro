@@ -23,7 +23,7 @@ agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99
 
 - **双行信息看板 + 窄窗口自适应**：
   - **第一行**：项目目录与 Git 状态（分支名、远程同步 `↑`/`↓`、未提交变更明细 `+staged ~modified ?untracked` 或 `✓`）、Context 占用（`已用/总量`）、Prompt Cache 命中率、5h 窗口余量 / Token 消耗 / 重置倒计时 / 快速消耗预警（`⚡快`）、周配额余量 / Token 消耗 / 重置倒计时。
-  - **第二行**：完整模型名与思考强度（`Low`/`Medium`/`High`/`XHigh`/`Max`）、账号邮箱、订阅套餐、执行模式（`auto`/`plan`/`accept-edits`）、沙箱状态（`ON`/`OFF`）。
+  - **第二行**：完整模型名与思考强度（`Low`/`Medium`/`High`/`XHigh`/`Max`）、账号邮箱、订阅套餐、执行模式（`auto`/`plan`/`accept-edits`）、沙箱状态（`ON`/`OFF`），以及工作中的实时活跃与速率指示（如 `● run_command 18s · ~56 t/s`，超过 60 秒无进展自动变黄提醒，空闲时自动收敛为上轮速率 `~56 t/s`）。
   - 依据 `terminal_width` 自动裁剪次要字段，分屏变窄不折行。
 - **5 格靶心圆点进度条 + 三色预警**：
   - 默认采用高对比度靶心圆点（`◉`/`○`），消耗 `≤80%` 绿色、`>80%` 黄色、`>90%` 红色，圆点与百分比数字同色。
@@ -64,6 +64,7 @@ cd ~/.gemini/plugins/agy-hud-pro
 | :--- | :--- | :--- |
 | `AGY_HUD_DOT_STYLE` | `bullseye` | 进度样式：`bullseye` / `pill` / `small` / `square` / `diamond` / `classic` |
 | `AGY_HUD_GIT_TIMEOUT_MS` | `150` | `git status` 超时阈值（毫秒），超时后自动回退读取 `.git/HEAD` |
+| `AGY_HUD_STALL_SEC` | `60` | 工作中无 token 或步骤推进超过该秒数时，活跃指示灯变黄提醒 |
 | `AGY_HUD_SHOW_NON_GIT` | `0` | 设为 `1` 时在非 Git 目录显示 `git:-` |
 | `AGY_HUD_WARN_THRESHOLD` | `15` | `PreInvocation` 主动配额预警阈值（%） |
 | `AGY_HUD_5H_BUDGET` | `5000000` | 无云端配额时的 5h 本地估算基准（tokens） |

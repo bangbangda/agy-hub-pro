@@ -7,7 +7,7 @@
  *
  * Renders compact 2-line ANSI dashboard:
  *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ Cache: 98% │ 5h: ◉◉◉◉○ 83% (238K tok · 3h18m) │ Wk: ◉◉◉◉○ 74% (238K tok · 5d9h)
- *   Line 2: [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF
+ *   Line 2: [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ ● run_command 18s · ~56 t/s
  */
 
 import fs from 'node:fs';
@@ -21,6 +21,9 @@ const PLUGIN_DIR = path.dirname(__filename);
 const STATE_FILE = process.env.AGY_HUD_STATE_FILE || path.join(PLUGIN_DIR, 'state.json');
 const LAST_STDIN_FILE = process.env.AGY_HUD_LAST_STDIN || '/tmp/agy-hud-last-stdin.json';
 const GIT_TIMEOUT_MS = Number(process.env.AGY_HUD_GIT_TIMEOUT_MS || 150);
+const STALL_WARN_MS = Math.max(5, Number(process.env.AGY_HUD_STALL_SEC || 60)) * 1000;
+const IDLE_SPEED_TTL_MS = 10 * 60 * 1000;
+const TRANSCRIPT_TAIL_BYTES = 16384;
 
 const USE_COLOR = !process.env.NO_COLOR;
 const ANSI = {
@@ -445,6 +448,192 @@ function extractSessionTotalTokens(payload) {
   return sum > 0 ? Math.round(sum) : 0;
 }
 
+function extractSessionOutputTokens(payload) {
+  const cw = payload.context_window || payload.contextWindow || {};
+  const outTok = Number(
+    cw.total_output_tokens ?? cw.totalOutputTokens ?? payload.total_output_tokens ?? 0
+  );
+  return Number.isFinite(outTok) && outTok > 0 ? Math.round(outTok) : 0;
+}
+
+function extractAgentWorking(payload) {
+  const raw =
+    payload.agent_state ??
+    payload.agentState ??
+    payload.state ??
+    payload.status ??
+    '';
+  if (typeof raw !== 'string') return false;
+  const s = raw.trim().toLowerCase();
+  return (
+    s === 'working' ||
+    s === 'running' ||
+    s === 'thinking' ||
+    s === 'streaming' ||
+    s === 'executing' ||
+    s === 'in_progress' ||
+    s === 'busy'
+  );
+}
+
+function extractNativeTokensPerSec(payload) {
+  const candidates = [
+    payload.tokens_per_second,
+    payload.tokensPerSecond,
+    payload.output_tokens_per_second,
+    payload.outputTokensPerSecond,
+    payload.context_window?.tokens_per_second,
+    payload.contextWindow?.tokensPerSecond,
+    payload.usage?.tokens_per_second,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (c != null && Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+function resolveTranscriptPath(payload) {
+  const raw = payload.transcript_path || payload.transcriptPath || '';
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const trimmed = raw.trim();
+  if (fs.existsSync(trimmed)) return trimmed;
+  // Fallback: agy stdin may report ~/.gemini/antigravity/brain/... while CLI stores under antigravity-cli
+  if (trimmed.includes('/.gemini/antigravity/brain/')) {
+    const alt = trimmed.replace('/.gemini/antigravity/brain/', '/.gemini/antigravity-cli/brain/');
+    if (fs.existsSync(alt)) return alt;
+  }
+  return null;
+}
+
+function normalizeToolLabel(rawName) {
+  if (!rawName || typeof rawName !== 'string') return '';
+  let name = rawName.trim().replace(/^(?:default_api:|functions\.)/i, '');
+  if (name.length > 20) name = `${name.slice(0, 19)}…`;
+  return name;
+}
+
+function readLatestTranscriptAction(payload) {
+  const filePath = resolveTranscriptPath(payload);
+  if (!filePath) return { label: '思考中', stepKey: null };
+
+  let fd = null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size === 0) return { label: '思考中', stepKey: null };
+
+    const readLen = Math.min(stat.size, TRANSCRIPT_TAIL_BYTES);
+    const startPos = stat.size - readLen;
+    const buf = Buffer.allocUnsafe(readLen);
+    fd = fs.openSync(filePath, 'r');
+    const bytesRead = fs.readSync(fd, buf, 0, readLen, startPos);
+    const text = buf.subarray(0, bytesRead).toString('utf8');
+
+    const lines = text.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        // Last line exceeded TRANSCRIPT_TAIL_BYTES; degrade safely and use file size as progress signal
+        return { label: '思考中', stepKey: `size:${stat.size}` };
+      }
+
+      const stepIdx = entry.step_index ?? entry.stepIndex ?? '';
+      const type = String(entry.type || '').toUpperCase();
+      const toolCalls = Array.isArray(entry.tool_calls)
+        ? entry.tool_calls
+        : Array.isArray(entry.toolCalls)
+          ? entry.toolCalls
+          : [];
+
+      if (type === 'PLANNER_RESPONSE' && toolCalls.length > 0) {
+        const names = toolCalls
+          .map((tc) => normalizeToolLabel(tc?.name || tc?.function?.name || tc?.tool_name || ''))
+          .filter(Boolean);
+        if (names.length > 0) {
+          const lastName = names[names.length - 1];
+          const allSame = names.length > 1 && names.every((n) => n === lastName);
+          const label = allSame ? `${lastName}×${names.length}` : lastName;
+          return { label, stepKey: `${stepIdx}:${label}` };
+        }
+      }
+
+      return { label: '思考中', stepKey: `${stepIdx}:${type || 'thinking'}` };
+    }
+  } catch {
+    // Never fail statusline on transcript I/O error
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  return { label: '思考中', stepKey: null };
+}
+
+function formatElapsedCompact(ms) {
+  const sec = Math.floor(Math.max(0, ms) / 1000);
+  if (sec < 1) return '';
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  if (min < 60) return remSec > 0 ? `${min}m${remSec}s` : `${min}m`;
+  const hr = Math.floor(min / 60);
+  const remMin = min % 60;
+  return remMin > 0 ? `${hr}h${remMin}m` : `${hr}h`;
+}
+
+function formatTokensPerSec(tps, isEstimated) {
+  if (typeof tps !== 'number' || !Number.isFinite(tps) || tps <= 0) return '';
+  const val = tps >= 10 ? `${Math.round(tps)}` : tps.toFixed(1).replace(/\.0$/, '');
+  return `${isEstimated ? '~' : ''}${val} t/s`;
+}
+
+function formatActivitySegment(activity, isWorking, nativeTps, transcriptAction, now) {
+  const isEstimated = nativeTps === null;
+  const activeTps =
+    nativeTps !== null
+      ? nativeTps
+      : activity?.lastTps != null &&
+          activity.lastTpsAt > 0 &&
+          (isWorking || now - activity.lastTpsAt <= IDLE_SPEED_TTL_MS)
+        ? activity.lastTps
+        : null;
+  const tpsLabel = activeTps !== null ? formatTokensPerSec(activeTps, isEstimated) : '';
+
+  if (isWorking) {
+    const startAt = activity?.workStartAt || now;
+    const progressAt = activity?.lastProgressAt || startAt;
+    const elapsedStr = formatElapsedCompact(now - startAt);
+    const isStalled = now - progressAt >= STALL_WARN_MS;
+
+    const dotColor = isStalled ? ANSI.yellow : ANSI.green;
+    const actionLabel = transcriptAction?.label || '思考中';
+    const actionColor = actionLabel === '思考中' ? ANSI.dim : ANSI.cyan;
+    const elapsedColor = isStalled ? ANSI.yellow : ANSI.dim;
+
+    let text = `${dotColor}●${ANSI.reset} ${actionColor}${actionLabel}${ANSI.reset}`;
+    if (elapsedStr) text += ` ${elapsedColor}${elapsedStr}${ANSI.reset}`;
+    if (tpsLabel) {
+      text += ` ${ANSI.dim}·${ANSI.reset} ${ANSI.cyan}${tpsLabel}${ANSI.reset}`;
+    }
+    return { priority: 5, text };
+  }
+
+  if (tpsLabel) {
+    return { priority: 1, text: `${ANSI.dim}${tpsLabel}${ANSI.reset}` };
+  }
+
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // State cache reader & live incremental ledger sync (pure local, zero network)
 // ---------------------------------------------------------------------------
@@ -560,7 +749,119 @@ function resolveWindowWeekStartMs(liveQuota, state, now = Date.now()) {
   });
 }
 
-function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName) {
+function syncActivityState(state, payload, now, isWorking, outTok, nativeTps, transcriptAction) {
+  const sessionId = payload.conversation_id || payload.session_id || payload.conversationId || '_default';
+  const prev = state.activity && typeof state.activity === 'object' ? state.activity : null;
+  const sameSession = Boolean(prev && prev.sessionId === sessionId);
+
+  let dirty = false;
+  const act = sameSession
+    ? { ...prev }
+    : {
+        sessionId,
+        isWorking: false,
+        workStartAt: null,
+        lastProgressAt: null,
+        lastOutTokens: outTok,
+        lastOutAt: now,
+        lastTps: null,
+        lastTpsAt: 0,
+        lastStepKey: null,
+      };
+
+  if (!sameSession && (isWorking || outTok > 0)) {
+    dirty = true;
+  }
+
+  const wasWorking = Boolean(act.isWorking);
+
+  // Detect output token growth -> estimate tokens/sec
+  if (outTok > 0 && act.lastOutTokens > 0 && outTok < act.lastOutTokens) {
+    // Session compacted or counter reset
+    act.lastOutTokens = outTok;
+    act.lastOutAt = now;
+    dirty = true;
+  } else if (outTok > (act.lastOutTokens || 0)) {
+    const deltaOut = outTok - (act.lastOutTokens || 0);
+    const refTime = act.lastOutAt || act.workStartAt || 0;
+    const dtMs = refTime > 0 ? now - refTime : 0;
+
+    // Only compute speed when we have a prior anchor within a sane interval (200ms .. 2min)
+    if (sameSession && dtMs >= 200 && dtMs <= 120_000) {
+      const rawTps = deltaOut / (dtMs / 1000);
+      if (rawTps >= 0.5 && rawTps <= 5000) {
+        const smoothed =
+          typeof act.lastTps === 'number' &&
+          Number.isFinite(act.lastTps) &&
+          act.lastTpsAt > 0 &&
+          now - act.lastTpsAt < 30_000
+            ? act.lastTps * 0.35 + rawTps * 0.65
+            : rawTps;
+        act.lastTps = Math.round(smoothed * 10) / 10;
+        act.lastTpsAt = now;
+      }
+    }
+    act.lastOutTokens = outTok;
+    act.lastOutAt = now;
+    act.lastProgressAt = now;
+    dirty = true;
+  } else if (outTok > 0 && !act.lastOutTokens) {
+    act.lastOutTokens = outTok;
+    act.lastOutAt = now;
+    dirty = true;
+  }
+
+  if (nativeTps !== null) {
+    const roundedNative = Math.round(nativeTps * 10) / 10;
+    if (act.lastTps !== roundedNative || now - (act.lastTpsAt || 0) > 5_000) {
+      act.lastTps = roundedNative;
+      act.lastTpsAt = now;
+      dirty = true;
+    }
+  }
+
+  // Handle working / idle transitions
+  if (isWorking && !wasWorking) {
+    act.isWorking = true;
+    act.workStartAt = now;
+    act.lastProgressAt = now;
+    if (act.lastOutAt !== now) {
+      act.lastOutAt = now;
+      act.lastOutTokens = outTok;
+    }
+    // Clear stale speed from a prior turn unless freshly computed on this tick
+    if (act.lastTpsAt !== now && nativeTps === null) {
+      act.lastTps = null;
+      act.lastTpsAt = 0;
+    }
+    act.lastStepKey = transcriptAction?.stepKey || null;
+    dirty = true;
+  } else if (isWorking && wasWorking) {
+    if (!act.workStartAt) {
+      act.workStartAt = now;
+      dirty = true;
+    }
+    if (!act.lastProgressAt) {
+      act.lastProgressAt = act.workStartAt;
+      dirty = true;
+    }
+    if (transcriptAction?.stepKey && transcriptAction.stepKey !== act.lastStepKey) {
+      act.lastStepKey = transcriptAction.stepKey;
+      act.lastProgressAt = now;
+      dirty = true;
+    }
+  } else if (!isWorking && wasWorking) {
+    act.isWorking = false;
+    act.workStartAt = null;
+    act.lastStepKey = null;
+    dirty = true;
+  }
+
+  state.activity = act;
+  return { activity: act, dirty };
+}
+
+function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName, activityInput) {
   const now = Date.now();
   const state = existing && typeof existing === 'object'
     ? existing
@@ -595,6 +896,20 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
   if (!Array.isArray(state.ledger)) state.ledger = [];
 
   let dirty = !existing && Boolean(payload.session_id || payload.conversation_id);
+
+  // 0. Live working state, elapsed timer & output tokens/sec tracker
+  if (activityInput) {
+    const actRes = syncActivityState(
+      state,
+      payload,
+      now,
+      activityInput.isWorking,
+      activityInput.outTok,
+      activityInput.nativeTps,
+      activityInput.transcriptAction
+    );
+    if (actRes.dirty) dirty = true;
+  }
 
   // 1. Live cross-session token ledger sync (no hook dependency required)
   const sessionId = payload.conversation_id || payload.session_id || payload.conversationId || '';
@@ -1020,7 +1335,7 @@ function colorByPlan(plan) {
   return ANSI.green;
 }
 
-function buildLine2(payload, modelBadge, sep, maxWidth) {
+function buildLine2(payload, modelBadge, activityItem, sep, maxWidth) {
   const account = extractAccountInfo(payload);
 
   // Assign priority (higher = kept longer on narrow terminals)
@@ -1046,6 +1361,8 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
 
   const sandboxSeg = formatSandboxSegment(payload);
   if (sandboxSeg) items.push({ priority: 2, text: sandboxSeg });
+
+  if (activityItem) items.push(activityItem);
 
   if (items.length === 0) return null;
 
@@ -1092,11 +1409,20 @@ async function main() {
     `${ANSI.dim}Ctx:${ANSI.reset} ${ctxDots} ${ctxColor}${formatPct(ctx.usedPct, 1)}${ANSI.reset} ` +
     `${ANSI.dim}(${ctxDetail})${ANSI.reset}`;
 
-  // 2 & 3. 5h Window & Weekly Quota + Consumed Tokens + Reset Countdowns
+  // 2 & 3. 5h Window & Weekly Quota + Consumed Tokens + Reset Countdowns + Live Activity
   // Displayed as remaining %; color follows consumed % (100 - remaining): >80% yellow, >90% red
   const liveQuota = extractLiveQuotaFromStdin(payload);
   const sessionTok = extractSessionTotalTokens(payload);
-  const state = syncLiveState(payload, existingState, liveQuota, sessionTok, ctx.usedTokens, modelInfo.name);
+  const isWorking = extractAgentWorking(payload);
+  const outTok = extractSessionOutputTokens(payload);
+  const nativeTps = extractNativeTokensPerSec(payload);
+  const transcriptAction = isWorking ? readLatestTranscriptAction(payload) : null;
+  const state = syncLiveState(payload, existingState, liveQuota, sessionTok, ctx.usedTokens, modelInfo.name, {
+    isWorking,
+    outTok,
+    nativeTps,
+    transcriptAction,
+  });
   const stateEstimated = state ? Boolean(state.quota?.isEstimated) : true;
 
   const rem5h = liveQuota.rem5h ?? state?.quota?.remaining5h ?? 100;
@@ -1168,8 +1494,9 @@ async function main() {
 
   const lines = [line1];
 
-  // Line 2: [Model · Effort] + User + Plan + Mode + Sandbox
-  const line2 = buildLine2(payload, modelBadge, sep, maxWidth);
+  // Line 2: [Model · Effort] + User + Plan + Mode + Sandbox + Live Activity / Speed
+  const activityItem = formatActivitySegment(state?.activity, isWorking, nativeTps, transcriptAction, nowMs);
+  const line2 = buildLine2(payload, modelBadge, activityItem, sep, maxWidth);
   if (line2) lines.push(line2);
 
   process.stdout.write(`${lines.join('\n')}\n`);

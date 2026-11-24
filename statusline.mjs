@@ -6,7 +6,7 @@
  * Zero external dependencies (macOS native Node.js ESM).
  *
  * Renders compact 2-line ANSI dashboard:
- *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ Cache: 98% │ 5h: ◉◉◉◉○ 83% (238K tok · 3h18m) │ Wk: ◉◉◉◉○ 74% (238K tok · 5d9h)
+ *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ Tok: 1.4M │ Cache: 98% │ 5h: ◉◉◉◉○ 83% (3h18m) │ Wk: ◉◉◉◉○ 74% (5d9h)
  *   Line 2: [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ ● run_command 18s · ~56 t/s
  */
 
@@ -24,6 +24,7 @@ const GIT_TIMEOUT_MS = Number(process.env.AGY_HUD_GIT_TIMEOUT_MS || 150);
 const STALL_WARN_MS = Math.max(5, Number(process.env.AGY_HUD_STALL_SEC || 60)) * 1000;
 const TRANSCRIPT_TAIL_BYTES = 16384;
 const MAX_TRACKED_WINDOWS = 16;
+const MAX_SESSION_TOKEN_CACHE = 32;
 
 const USE_COLOR = !process.env.NO_COLOR;
 const ANSI = {
@@ -919,6 +920,111 @@ function syncActivityState(state, payload, now, windowId, isWorking, outTok, nat
   return { activity: act, dirty };
 }
 
+function syncSessionNetTokens(state, payload, now) {
+  const filePath = resolveTranscriptPath(payload);
+  if (!filePath) return { netTokens: null, dirty: false };
+
+  const sessionId =
+    payload.conversation_id || payload.session_id || payload.conversationId || filePath;
+  if (!state.sessionTokens || typeof state.sessionTokens !== 'object') {
+    state.sessionTokens = {};
+  }
+
+  let fd = null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return { netTokens: null, dirty: false };
+
+    const prev =
+      state.sessionTokens[sessionId] && typeof state.sessionTokens[sessionId] === 'object'
+        ? state.sessionTokens[sessionId]
+        : null;
+
+    const validPrev =
+      prev &&
+      prev.filePath === filePath &&
+      typeof prev.offset === 'number' &&
+      prev.offset >= 0 &&
+      prev.offset <= stat.size;
+
+    const entry = validPrev
+      ? { ...prev }
+      : {
+          filePath,
+          offset: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          updatedAt: now,
+        };
+
+    let dirty = !validPrev && stat.size > 0;
+
+    if (stat.size > entry.offset) {
+      const deltaLen = stat.size - entry.offset;
+      const buf = Buffer.allocUnsafe(deltaLen);
+      fd = fs.openSync(filePath, 'r');
+      const bytesRead = fs.readSync(fd, buf, 0, deltaLen, entry.offset);
+      const chunk = buf.subarray(0, bytesRead);
+      const lastNl = chunk.lastIndexOf(0x0a);
+
+      if (lastNl >= 0) {
+        const completeText = chunk.subarray(0, lastNl).toString('utf8');
+        for (const rawLine of completeText.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          let rec;
+          try {
+            rec = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          // Net session tokens: non-cached input + output (excludes cache_read_tokens)
+          const inTok = Number(rec.input_tokens ?? rec.inputTokens ?? rec.usage?.input_tokens ?? 0);
+          const outTok = Number(rec.output_tokens ?? rec.outputTokens ?? rec.usage?.output_tokens ?? 0);
+          if (Number.isFinite(inTok) && inTok > 0) entry.inputTokens += inTok;
+          if (Number.isFinite(outTok) && outTok > 0) entry.outputTokens += outTok;
+        }
+        entry.offset += lastNl + 1;
+        entry.updatedAt = now;
+        dirty = true;
+      }
+    }
+
+    if (dirty) {
+      state.sessionTokens[sessionId] = entry;
+      const keys = Object.keys(state.sessionTokens);
+      if (keys.length > MAX_SESSION_TOKEN_CACHE) {
+        keys
+          .sort((a, b) => (state.sessionTokens[b]?.updatedAt || 0) - (state.sessionTokens[a]?.updatedAt || 0))
+          .slice(MAX_SESSION_TOKEN_CACHE)
+          .forEach((k) => {
+            delete state.sessionTokens[k];
+          });
+      }
+    }
+
+    const total = Math.round((entry.inputTokens || 0) + (entry.outputTokens || 0));
+    return { netTokens: total > 0 ? total : null, dirty };
+  } catch {
+    return { netTokens: null, dirty: false };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+function formatSessionTokensSegment(netTokens) {
+  if (typeof netTokens !== 'number' || !Number.isFinite(netTokens) || netTokens <= 0) {
+    return null;
+  }
+  return `${ANSI.dim}Tok:${ANSI.reset} ${ANSI.cyan}${formatCompactTokens(netTokens)}${ANSI.reset}`;
+}
+
 function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName, activityInput) {
   const now = Date.now();
   const state = existing && typeof existing === 'object'
@@ -969,6 +1075,10 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
     );
     if (actRes.dirty) dirty = true;
   }
+
+  // 0b. Accurate incremental net token count for the current session (from transcript.jsonl)
+  const sessionNetRes = syncSessionNetTokens(state, payload, now);
+  if (sessionNetRes.dirty) dirty = true;
 
   // 1. Live cross-session token ledger sync (no hook dependency required)
   const sessionId = payload.conversation_id || payload.session_id || payload.conversationId || '';
@@ -1066,7 +1176,7 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
     atomicWriteState(state);
   }
 
-  return state;
+  return { state, sessionNetTokens: sessionNetRes.netTokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,23 +1587,27 @@ async function main() {
   const outTok = extractSessionOutputTokens(payload);
   const nativeTps = extractNativeTokensPerSec(payload);
   const transcriptAction = isWorking ? readLatestTranscriptAction(payload) : null;
-  const state = syncLiveState(payload, existingState, liveQuota, sessionTok, ctx.usedTokens, modelInfo.name, {
-    windowId,
-    isWorking,
-    outTok,
-    nativeTps,
-    transcriptAction,
-  });
+  const { state, sessionNetTokens } = syncLiveState(
+    payload,
+    existingState,
+    liveQuota,
+    sessionTok,
+    ctx.usedTokens,
+    modelInfo.name,
+    {
+      windowId,
+      isWorking,
+      outTok,
+      nativeTps,
+      transcriptAction,
+    }
+  );
   const stateEstimated = state ? Boolean(state.quota?.isEstimated) : true;
 
   const rem5h = liveQuota.rem5h ?? state?.quota?.remaining5h ?? 100;
   const remWk = liveQuota.remWk ?? state?.quota?.remainingWeek ?? 100;
   const prefix5h = liveQuota.rem5h != null ? '' : stateEstimated ? '~' : '';
   const prefixWk = liveQuota.remWk != null ? '' : stateEstimated ? '~' : '';
-
-  const hasLedger = Array.isArray(state?.ledger) && state.ledger.length > 0;
-  const tok5h = hasLedger ? (state?.usage?.tokens5h ?? 0) : sessionTok;
-  const tokWk = hasLedger ? (state?.usage?.tokensWeek ?? 0) : sessionTok;
 
   const color5h = colorByUsage(100 - rem5h);
   const colorWk = colorByUsage(100 - remWk);
@@ -1519,18 +1633,12 @@ async function main() {
   const resetWkSec = liveQuota.resetWkSec ?? (resetWkTime ? null : state?.quota?.resetWeekSec ?? null);
   const resetWkLabel = formatResetCountdown(resetWkTime, resetWkSec);
 
-  const meta5hFull = reset5hLabel
-    ? `${formatCompactTokens(tok5h)} tok · ${reset5hLabel}${paceTag}`
-    : `${formatCompactTokens(tok5h)} tok${paceTag}`;
-  const metaWkFull = resetWkLabel
-    ? `${formatCompactTokens(tokWk)} tok · ${resetWkLabel}`
-    : `${formatCompactTokens(tokWk)} tok`;
-
+  const tokSeg = formatSessionTokensSegment(sessionNetTokens);
   const cacheSeg = formatCacheSegment(payload);
 
-  const makeLine1 = (compact, includeCache = true) => {
-    const m5h = compact ? (reset5hLabel ? `${reset5hLabel}${paceTag}` : '') : meta5hFull;
-    const mWk = compact ? (resetWkLabel || '') : metaWkFull;
+  const makeLine1 = ({ includeReset = true, includeCache = true, includeTok = true } = {}) => {
+    const m5h = includeReset ? (reset5hLabel ? `${reset5hLabel}${paceTag}` : paceTag.trim()) : '';
+    const mWk = includeReset ? (resetWkLabel || '') : '';
     const s5h =
       `${ANSI.dim}5h:${ANSI.reset} ${dots5h} ${color5h}${prefix5h}${formatPct(rem5h, 0)}${ANSI.reset}` +
       (m5h ? ` ${ANSI.dim}(${m5h})${ANSI.reset}` : '');
@@ -1540,17 +1648,21 @@ async function main() {
     const segs = [];
     if (wsGitSeg) segs.push(wsGitSeg);
     segs.push(segCtx);
+    if (includeTok && tokSeg) segs.push(tokSeg);
     if (includeCache && cacheSeg) segs.push(cacheSeg);
     segs.push(s5h, sWk);
     return segs.join(sep);
   };
 
-  let line1 = makeLine1(false, true);
-  if (visibleWidth(line1) > maxWidth) {
-    line1 = makeLine1(true, true);
-  }
+  let line1 = makeLine1({ includeReset: true, includeCache: true, includeTok: true });
   if (visibleWidth(line1) > maxWidth && cacheSeg) {
-    line1 = makeLine1(true, false);
+    line1 = makeLine1({ includeReset: true, includeCache: false, includeTok: true });
+  }
+  if (visibleWidth(line1) > maxWidth && tokSeg) {
+    line1 = makeLine1({ includeReset: true, includeCache: false, includeTok: false });
+  }
+  if (visibleWidth(line1) > maxWidth) {
+    line1 = makeLine1({ includeReset: false, includeCache: false, includeTok: false });
   }
 
   const lines = [line1];

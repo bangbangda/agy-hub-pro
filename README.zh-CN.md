@@ -15,14 +15,14 @@
 ![AGY HUD Pro 终端渲染效果预览](./assets/preview.png)
 
 ```text
-agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (289K tok · 3h18m) │ Wk: ◉◉◉◉○ 73% (1.4M tok · 5d7h)
+agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Tok: 1.4M │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (3h18m) │ Wk: ◉◉◉◉○ 73% (5d7h)
 [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ ● run_command 18s · ~56 t/s
 ```
 
 ## 核心特性
 
 - **双行信息看板 + 窄窗口自适应**：
-  - **第一行**：项目目录与 Git 状态（分支名、远程同步 `↑`/`↓`、未提交变更明细 `+staged ~modified ?untracked` 或 `✓`）、Context 占用（`已用/总量`）、Prompt Cache 命中率、5h 窗口余量 / Token 消耗 / 重置倒计时 / 快速消耗预警（`⚡快`）、周配额余量 / Token 消耗 / 重置倒计时。
+  - **第一行**：项目目录与 Git 状态（分支名、远程同步 `↑`/`↓`、未提交变更明细 `+staged ~modified ?untracked` 或 `✓`）、Context 占用（`已用/总量`）、当前会话精确净消耗 Token（`Tok:`，基于 `transcript.jsonl` 字节偏移增量统计 `input + output`，不含缓存重复读取）、Prompt Cache 命中率、5h 窗口余量 / 重置倒计时 / 快速消耗预警（`⚡快`）、周配额余量 / 重置倒计时。
   - **第二行**：完整模型名与思考强度（`Low`/`Medium`/`High`/`XHigh`/`Max`）、账号邮箱、订阅套餐、执行模式（`auto`/`plan`/`accept-edits`）、沙箱状态（`ON`/`OFF`），以及实时活跃与吞吐速率指示（工作中显示 `● run_command 18s · ~56 t/s`，超过 60 秒无进展自动变黄提醒；`~56 t/s` 在当前终端窗口生命周期内持续保留，包含执行 `/clear` 后也不会归零或清空）。
   - 依据 `terminal_width` 自动裁剪次要字段，分屏变窄不折行。
 - **5 格靶心圆点进度条 + 三色预警**：

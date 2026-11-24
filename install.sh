@@ -289,7 +289,7 @@ const st = {
 fs.writeFileSync(stateFile, JSON.stringify(st, null, 2));
 NODE_EOF
 
-  # 7a. statusline.mjs 使用 reset_time (now + 5d => 当前周期起算于 now - 2d)，仅计入 500K tok
+  # 7a. statusline.mjs 使用 reset_time (now + 5d => 当前周期起算于 now - 2d)，账本仅计入 500K，且 5h/Wk 状态栏不再显示不准确的 tok 数
   local rendered_align
   rendered_align="$(printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":10},"quota":{"gemini-weekly":{"remaining_fraction":0.85,"reset_time":"%s"}},"cwd":"/tmp"}\n' "${align_reset_iso}" \
     | NO_COLOR=1 AGY_HUD_STATE_FILE="${align_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/align-stdin.json" node "${STATUSLINE_SCRIPT}")"
@@ -305,8 +305,8 @@ if (st.quota.resetWeekTime !== expectedReset) {
   console.error(`FAIL 7a: expected resetWeekTime=${expectedReset}, got ${st.quota.resetWeekTime}`);
   process.exit(1);
 }
-if (!rendered.includes('500K tok')) {
-  console.error(`FAIL 7a: expected rendered output to include "500K tok", got:\n${rendered}`);
+if (rendered.includes('tok ·') || /\b\d+(?:\.\d+)?[KMB]?\s*tok\b/i.test(rendered)) {
+  console.error(`FAIL 7a: expected 5h/Wk rendered output to omit inaccurate tok counts, got:\n${rendered}`);
   process.exit(1);
 }
 NODE_EOF
@@ -514,7 +514,48 @@ if (!rendered.includes('84 t/s') || rendered.includes('~84 t/s')) {
 NODE_EOF
   log_ok "实时活跃状态、动作透出、卡顿提醒、/clear 保留与窗口级 t/s 隔离校验全部通过"
 
-  log_header "9. 验证字段嗅探文件 (/tmp/agy-hud-last-stdin.json)"
+  log_header "9. 验证当前会话净消耗 Token 精确增量统计 (Ctx -> Tok -> Cache，排除 cache_read)"
+  local tok_state="${tmp_dir}/state-session-tok.json"
+  local tok_transcript="${tmp_dir}/transcript-session-tok.jsonl"
+  printf '{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"hi"}\n' > "${tok_transcript}"
+  printf '{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":12000,"cache_read_tokens":500000,"output_tokens":3000}\n' >> "${tok_transcript}"
+  printf '{"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":8000,"cache_read_tokens":600000,"output_tokens":2000}\n' >> "${tok_transcript}"
+
+  # 9a. 首次扫描：12K+3K + 8K+2K = 25K（不含 1.1M cache_read），位置在 Ctx 后、Cache 前
+  local rendered_tok1
+  rendered_tok1="$(printf '{"session_id":"sess-tok","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":15,"current_usage":{"input_tokens":2000,"cache_read_input_tokens":98000}},"quota":{"gemini-5h":{"remaining_fraction":0.8,"reset_in_seconds":7200},"gemini-weekly":{"remaining_fraction":0.75,"reset_in_seconds":345600}},"transcript_path":"%s","cwd":"/tmp"}\n' "${tok_transcript}" \
+    | NO_COLOR=1 AGY_HUD_STATE_FILE="${tok_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/tok-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_tok1}" <<'NODE_EOF'
+const rendered = process.argv[2];
+const line1 = rendered.split('\n')[0] || '';
+const idxCtx = line1.indexOf('Ctx:');
+const idxTok = line1.indexOf('Tok: 25K');
+const idxCache = line1.indexOf('Cache: 98%');
+if (idxCtx < 0 || idxTok < 0 || idxCache < 0 || !(idxCtx < idxTok && idxTok < idxCache)) {
+  console.error(`FAIL 9a: expected "Ctx:" < "Tok: 25K" < "Cache: 98%", got:\n${line1}`);
+  process.exit(1);
+}
+if (line1.includes('tok ·')) {
+  console.error(`FAIL 9a: 5h/Wk should not render tok counts, got:\n${line1}`);
+  process.exit(1);
+}
+NODE_EOF
+
+  # 9b. 再次刷新（文件无变化）不应重复累加；追加新步骤 (+75K) 后精确增至 100K
+  printf '{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":60000,"cache_read_tokens":900000,"output_tokens":15000}\n' >> "${tok_transcript}"
+  local rendered_tok2
+  rendered_tok2="$(printf '{"session_id":"sess-tok","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":15,"current_usage":{"input_tokens":2000,"cache_read_input_tokens":98000}},"transcript_path":"%s","cwd":"/tmp"}\n' "${tok_transcript}" \
+    | NO_COLOR=1 AGY_HUD_STATE_FILE="${tok_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/tok-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_tok2}" <<'NODE_EOF'
+const rendered = process.argv[2];
+if (!rendered.includes('Tok: 100K')) {
+  console.error(`FAIL 9b: expected incremental "Tok: 100K", got:\n${rendered}`);
+  process.exit(1);
+}
+NODE_EOF
+  log_ok "当前会话净消耗 Token 增量统计与位置顺序校验全部通过 (25K -> 100K)"
+
+  log_header "10. 验证字段嗅探文件 (/tmp/agy-hud-last-stdin.json)"
   if [[ -f "${test_stdin_dump}" ]]; then
     log_ok "已生成 ${test_stdin_dump}（前 8 行）："
     head -n 8 "${test_stdin_dump}" | sed 's/^/  /'

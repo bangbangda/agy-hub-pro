@@ -15,14 +15,14 @@ A lightweight, zero-dependency **Antigravity CLI (`agy`)** two-line StatusLine d
 ![AGY HUD Pro Terminal Preview](./assets/preview.png)
 
 ```text
-agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (289K tok · 3h18m) │ Wk: ◉◉◉◉○ 73% (1.4M tok · 5d7h)
+agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Tok: 1.4M │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (3h18m) │ Wk: ◉◉◉◉○ 73% (5d7h)
 [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ ● run_command 18s · ~56 t/s
 ```
 
 ## Features
 
 - **Two-Line Telemetry Dashboard + Responsive Width Fitting**
-  - **Line 1**: Workspace name & Git status (branch, ahead/behind `↑`/`↓`, uncommitted breakdown `+staged ~modified ?untracked` or `✓`), context window usage (`used/max`), Prompt Cache hit rate, 5-hour rolling window quota & token ledger with reset countdown and fast-burn indicator (`⚡快`), and weekly quota & token ledger with reset countdown.
+  - **Line 1**: Workspace name & Git status (branch, ahead/behind `↑`/`↓`, uncommitted breakdown `+staged ~modified ?untracked` or `✓`), context window usage (`used/max`), exact current-session net token consumption (`Tok:`, incremental `input + output` from `transcript.jsonl`, excluding cache reads), Prompt Cache hit rate, 5-hour rolling window quota & reset countdown with fast-burn indicator (`⚡快`), and weekly quota & reset countdown.
   - **Line 2**: Full model name with reasoning effort (`Low` / `Medium` / `High` / `XHigh` / `Max`), account email, subscription plan tier, execution mode (`auto` / `plan` / `accept-edits`), sandbox status (`ON` / `OFF`), and a live activity & throughput indicator (`● run_command 18s · ~56 t/s` while working, turning yellow after 60s without progress; `~56 t/s` stays visible for the full terminal window lifecycle including across `/clear`).
   - Automatically adapts to `terminal_width` by trimming lower-priority fields so split panes never wrap awkwardly.
 - **5-Dot Bullseye Progress Indicators & Threshold Coloring**

@@ -1,9 +1,16 @@
 #!/usr/bin/env node
 /**
- * agy-hud-pro / statusline.mjs
+ * agy-hub-pro / statusline.mjs
  *
- * Millisecond synchronous StatusLine renderer for Antigravity CLI (agy).
- * Zero external dependencies (macOS native Node.js ESM).
+ * Millisecond synchronous StatusLine renderer & diagnostics CLI for Antigravity CLI (agy).
+ * Zero external dependencies (native Node.js ESM).
+ *
+ * Usage:
+ *   <json> | node statusline.mjs       # Render 2-line ANSI HUD from agy stdin payload
+ *   node statusline.mjs --test         # Preview rendered ANSI output using simulated session JSON
+ *   node statusline.mjs --doctor       # Run environment, config mount, and cache health diagnostics
+ *   node statusline.mjs --version      # Print plugin version
+ *   node statusline.mjs --help         # Show CLI help
  *
  * Renders compact 2-line ANSI dashboard:
  *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ Cache: 98% │ 5h: ◉◉◉◉○ 83% (238K tok · 3h18m) │ Wk: ◉◉◉◉○ 74% (238K tok · 5d9h)
@@ -11,6 +18,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -18,9 +26,41 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const PLUGIN_DIR = path.dirname(__filename);
 
-const STATE_FILE = process.env.AGY_HUD_STATE_FILE || path.join(PLUGIN_DIR, 'state.json');
-const LAST_STDIN_FILE = process.env.AGY_HUD_LAST_STDIN || '/tmp/agy-hud-last-stdin.json';
-const GIT_TIMEOUT_MS = Number(process.env.AGY_HUD_GIT_TIMEOUT_MS || 150);
+const DEFAULT_DATA_DIR = path.join(os.homedir(), '.gemini', 'plugins', 'agy-hub-pro', 'data');
+const FALLBACK_DATA_DIR = path.join(os.tmpdir(), 'agy-hub-pro-data');
+
+function resolveDataDir() {
+  const envDir = process.env.AGY_HUB_DATA_DIR || process.env.AGY_HUD_DATA_DIR;
+  const candidates = envDir ? [envDir, FALLBACK_DATA_DIR] : [DEFAULT_DATA_DIR, FALLBACK_DATA_DIR];
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK);
+      return { dir, isFallback: !envDir && dir === FALLBACK_DATA_DIR };
+    } catch {
+      // Try next writable location
+    }
+  }
+  return { dir: FALLBACK_DATA_DIR, isFallback: true };
+}
+
+const RESOLVED_DATA = resolveDataDir();
+const DATA_DIR = RESOLVED_DATA.dir;
+const EXPLICIT_STATE_FILE = process.env.AGY_HUB_STATE_FILE || process.env.AGY_HUD_STATE_FILE || '';
+const STATE_FILE = EXPLICIT_STATE_FILE || path.join(DATA_DIR, 'state.json');
+const LOCK_FILE =
+  process.env.AGY_HUB_LOCK_FILE ||
+  process.env.AGY_HUD_LOCK_FILE ||
+  path.join(DATA_DIR, 'collector.lock');
+const LAST_STDIN_FILE =
+  process.env.AGY_HUB_LAST_STDIN ||
+  process.env.AGY_HUD_LAST_STDIN ||
+  path.join(DATA_DIR, 'last-stdin.json');
+const GIT_TIMEOUT_MS = Number(
+  process.env.AGY_HUB_GIT_TIMEOUT_MS || process.env.AGY_HUD_GIT_TIMEOUT_MS || 150
+);
+const SHOW_NON_GIT =
+  (process.env.AGY_HUB_SHOW_NON_GIT || process.env.AGY_HUD_SHOW_NON_GIT) === '1';
 
 const USE_COLOR = !process.env.NO_COLOR;
 const ANSI = {
@@ -50,8 +90,12 @@ const DOT_STYLES = {
   diamond: { filled: '◆', empty: '◇', sep: '' },
   classic: { filled: '●', empty: '○', sep: '' },
 };
-const ACTIVE_DOT_STYLE =
-  DOT_STYLES[(process.env.AGY_HUD_DOT_STYLE || 'bullseye').toLowerCase()] || DOT_STYLES.bullseye;
+const ACTIVE_DOT_STYLE_NAME = (
+  process.env.AGY_HUB_DOT_STYLE ||
+  process.env.AGY_HUD_DOT_STYLE ||
+  'bullseye'
+).toLowerCase();
+const ACTIVE_DOT_STYLE = DOT_STYLES[ACTIVE_DOT_STYLE_NAME] || DOT_STYLES.bullseye;
 
 function colorByUsage(usedPct) {
   if (typeof usedPct !== 'number' || !Number.isFinite(usedPct)) return ANSI.dim;
@@ -155,17 +199,18 @@ async function readAndSniffStdin() {
       parsed = { _raw: raw };
     }
 
-    // Field sniffing dump: save on first run, debug mode, or latest snapshot
+    // Field sniffing dump: save latest snapshot into data directory
     try {
+      const debugFlag = process.env.AGY_HUB_DEBUG || process.env.AGY_HUD_DEBUG;
+      const sniffFlag = process.env.AGY_HUB_SNIFF ?? process.env.AGY_HUD_SNIFF;
       const shouldDump =
-        process.env.AGY_HUD_DEBUG === '1' ||
-        process.env.AGY_HUD_SNIFF !== '0' ||
-        !fs.existsSync(LAST_STDIN_FILE);
+        debugFlag === '1' || sniffFlag !== '0' || !fs.existsSync(LAST_STDIN_FILE);
       if (shouldDump) {
+        fs.mkdirSync(path.dirname(LAST_STDIN_FILE), { recursive: true });
         fs.writeFileSync(LAST_STDIN_FILE, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8');
       }
     } catch {
-      // Never break status line on /tmp write error
+      // Never break status line on snapshot write error
     }
 
     return parsed && typeof parsed === 'object' ? parsed : {};
@@ -433,8 +478,7 @@ function formatResetCountdown(resetTime, resetSec) {
   }
 
   const m = totalMin % 60;
-  const durStr = totalHours > 0 ? (m > 0 ? `${totalHours}h${m}m` : `${totalHours}h`) : `${m}m`;
-  return durStr;
+  return totalHours > 0 ? (m > 0 ? `${totalHours}h${m}m` : `${totalHours}h`) : `${m}m`;
 }
 
 function extractSessionTotalTokens(payload) {
@@ -515,13 +559,30 @@ function syncCachedResetTime(quotaState, field, liveTime, liveSec, windowMs, now
   return false;
 }
 
-function readStateCache() {
+function safeReadJson(filePath) {
   try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
-    return JSON.parse(raw);
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
   } catch {
     return null;
   }
+}
+
+function readStateCache() {
+  const direct = safeReadJson(STATE_FILE);
+  if (direct) return direct;
+  if (!EXPLICIT_STATE_FILE) {
+    const legacyCandidates = [
+      path.join(PLUGIN_DIR, 'state.json'),
+      path.join(os.homedir(), '.gemini', 'plugins', 'agy-hud-pro', 'state.json'),
+    ];
+    for (const legacyPath of legacyCandidates) {
+      if (legacyPath !== STATE_FILE) {
+        const legacy = safeReadJson(legacyPath);
+        if (legacy) return legacy;
+      }
+    }
+  }
+  return null;
 }
 
 function atomicWriteState(data) {
@@ -536,7 +597,6 @@ function atomicWriteState(data) {
 }
 
 function resolveWindow5hStartMs(liveQuota, state, now = Date.now()) {
-  // Align 5h token tally to the active quota cycle (reset_time - 5h) when known
   return resolveWindowStartMs({
     liveTime: liveQuota?.reset5hTime,
     liveSec: liveQuota?.reset5hSec,
@@ -548,8 +608,6 @@ function resolveWindow5hStartMs(liveQuota, state, now = Date.now()) {
 }
 
 function resolveWindowWeekStartMs(liveQuota, state, now = Date.now()) {
-  // Align weekly token tally to the active cloud quota cycle (reset_time - 7d) when known,
-  // falling back to local calendar week (Monday 00:00) only when no reset anchor exists.
   return resolveWindowStartMs({
     liveTime: liveQuota?.resetWkTime,
     liveSec: liveQuota?.resetWkSec,
@@ -560,34 +618,35 @@ function resolveWindowWeekStartMs(liveQuota, state, now = Date.now()) {
   });
 }
 
-function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName) {
+function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName, persist = true) {
   const now = Date.now();
-  const state = existing && typeof existing === 'object'
-    ? existing
-    : {
-        version: 1,
-        updatedAt: now,
-        lastRefreshAt: 0,
-        quota: {
-          remaining5h: 100,
-          remainingWeek: 100,
-          reset5hSec: null,
-          resetWeekSec: null,
-          reset5hTime: null,
-          resetWeekTime: null,
-          source: 'estimated',
-          isEstimated: true,
-          oauthDetected: false,
-        },
-        usage: {
-          tokens5h: 0,
-          tokensWeek: 0,
-          budget5h: 5_000_000,
-          budgetWeek: 40_000_000,
-        },
-        conversations: {},
-        ledger: [],
-      };
+  const state =
+    existing && typeof existing === 'object'
+      ? existing
+      : {
+          version: 1,
+          updatedAt: now,
+          lastRefreshAt: 0,
+          quota: {
+            remaining5h: 100,
+            remainingWeek: 100,
+            reset5hSec: null,
+            resetWeekSec: null,
+            reset5hTime: null,
+            resetWeekTime: null,
+            source: 'estimated',
+            isEstimated: true,
+            oauthDetected: false,
+          },
+          usage: {
+            tokens5h: 0,
+            tokensWeek: 0,
+            budget5h: 5_000_000,
+            budgetWeek: 40_000_000,
+          },
+          conversations: {},
+          ledger: [],
+        };
 
   if (!state.quota) state.quota = {};
   if (!state.usage) state.usage = { tokens5h: 0, tokensWeek: 0 };
@@ -687,7 +746,7 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
     }
   }
 
-  if (dirty) {
+  if (dirty && persist) {
     state.updatedAt = now;
     atomicWriteState(state);
   }
@@ -744,6 +803,7 @@ function readBranchFromGitHead(startDir) {
 }
 
 function getGitInfo(payload) {
+  if (payload._mockGit) return payload._mockGit;
   const cwd = resolveWorkspaceDir(payload);
 
   try {
@@ -757,7 +817,7 @@ function getGitInfo(payload) {
     const lines = out.split(/\r?\n/).filter((l) => l.length > 0);
     if (lines.length === 0) return null;
 
-    const header = lines[0]; // e.g. "## main...origin/main [ahead 1, behind 2]" or "## No commits yet on main"
+    const header = lines[0];
     let branch = '';
     let ahead = 0;
     let behind = 0;
@@ -891,10 +951,10 @@ function extractCacheHitPct(payload) {
 
 function isBurning5hFast(rem5h, reset5hSec) {
   if (typeof rem5h !== 'number' || typeof reset5hSec !== 'number') return false;
-  if (rem5h >= 70) return false; // plenty left, don't nag early
+  if (rem5h >= 70) return false;
   const windowSec = 5 * 3600;
   const elapsedFrac = Math.max(0, Math.min(1, (windowSec - reset5hSec) / windowSec));
-  if (elapsedFrac < 0.08) return false; // wait at least ~24m into window for stable pace
+  if (elapsedFrac < 0.08) return false;
   const usedFrac = (100 - rem5h) / 100;
   return usedFrac > elapsedFrac * 1.25;
 }
@@ -944,7 +1004,7 @@ function formatWorkspaceGitSegment(payload, git) {
     return `${ANSI.bold}${project}${ANSI.reset} ${ANSI.dim}(${ANSI.reset}${formatGitSegment(git)}${ANSI.dim})${ANSI.reset}`;
   }
   if (git) return formatGitSegment(git);
-  if (project && process.env.AGY_HUD_SHOW_NON_GIT === '1') {
+  if (project && SHOW_NON_GIT) {
     return `${ANSI.bold}${project}${ANSI.reset} ${ANSI.dim}(git:-)${ANSI.reset}`;
   }
   if (project) return `${ANSI.bold}${project}${ANSI.reset}`;
@@ -952,7 +1012,6 @@ function formatWorkspaceGitSegment(payload, git) {
 }
 
 function visibleWidth(str) {
-  // Strip ANSI escape sequences and estimate CJK double-width characters
   const plain = str.replace(/\x1b\[[0-9;]*m/g, '');
   let w = 0;
   for (const ch of plain) {
@@ -1023,7 +1082,6 @@ function colorByPlan(plan) {
 function buildLine2(payload, modelBadge, sep, maxWidth) {
   const account = extractAccountInfo(payload);
 
-  // Assign priority (higher = kept longer on narrow terminals)
   const items = [];
   if (modelBadge) items.push({ priority: 6, text: modelBadge });
 
@@ -1049,7 +1107,6 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
 
   if (items.length === 0) return null;
 
-  // Trim lowest-priority segments only when exceeding terminal_width
   const active = [...items];
   while (active.length > 1 && visibleWidth(active.map((i) => i.text).join(sep)) > maxWidth) {
     let minIdx = 0;
@@ -1063,26 +1120,21 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
 }
 
 // ---------------------------------------------------------------------------
-// Main render pipeline
+// Core render function (shared by stdin runtime & --test preview)
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const payload = await readAndSniffStdin();
-  const existingState = readStateCache();
+function renderDashboard(payload, existingState, { persist = true } = {}) {
   const maxWidth = resolveTerminalWidth(payload);
   const sep = ` ${ANSI.dim}│${ANSI.reset} `;
 
-  // Model Name + Reasoning Effort badge (placed at start of Line 2)
   const modelInfo = extractModelInfo(payload);
   const modelBadge = modelInfo.effort
     ? `${ANSI.bold}${ANSI.cyan}[${modelInfo.name}${ANSI.reset} ${ANSI.dim}·${ANSI.reset} ${ANSI.bold}${modelInfo.effort.color}${modelInfo.effort.label}${ANSI.reset}${ANSI.bold}${ANSI.cyan}]${ANSI.reset}`
     : `${ANSI.bold}${ANSI.cyan}[${modelInfo.name}]${ANSI.reset}`;
 
-  // Workspace + Git segment (placed at start of Line 1)
   const git = getGitInfo(payload);
   const wsGitSeg = formatWorkspaceGitSegment(payload, git);
 
-  // 1. Context Window (displayed as used %, >80% yellow, >90% red)
   const ctx = extractContextWindow(payload);
   const ctxColor = colorByUsage(ctx.usedPct);
   const ctxDots = renderDots(ctx.usedPct, ctxColor);
@@ -1092,11 +1144,17 @@ async function main() {
     `${ANSI.dim}Ctx:${ANSI.reset} ${ctxDots} ${ctxColor}${formatPct(ctx.usedPct, 1)}${ANSI.reset} ` +
     `${ANSI.dim}(${ctxDetail})${ANSI.reset}`;
 
-  // 2 & 3. 5h Window & Weekly Quota + Consumed Tokens + Reset Countdowns
-  // Displayed as remaining %; color follows consumed % (100 - remaining): >80% yellow, >90% red
   const liveQuota = extractLiveQuotaFromStdin(payload);
   const sessionTok = extractSessionTotalTokens(payload);
-  const state = syncLiveState(payload, existingState, liveQuota, sessionTok, ctx.usedTokens, modelInfo.name);
+  const state = syncLiveState(
+    payload,
+    existingState,
+    liveQuota,
+    sessionTok,
+    ctx.usedTokens,
+    modelInfo.name,
+    persist
+  );
   const stateEstimated = state ? Boolean(state.quota?.isEstimated) : true;
 
   const rem5h = liveQuota.rem5h ?? state?.quota?.remaining5h ?? 100;
@@ -1167,12 +1225,611 @@ async function main() {
   }
 
   const lines = [line1];
-
-  // Line 2: [Model · Effort] + User + Plan + Mode + Sandbox
   const line2 = buildLine2(payload, modelBadge, sep, maxWidth);
   if (line2) lines.push(line2);
 
-  process.stdout.write(`${lines.join('\n')}\n`);
+  return `${lines.join('\n')}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in CLI Commands: --test, --doctor, --version, --help
+// ---------------------------------------------------------------------------
+
+function readPluginVersion() {
+  const manifest = safeReadJson(path.join(PLUGIN_DIR, 'plugin.json'));
+  return manifest?.version || '1.0.0';
+}
+
+function runTestPreview() {
+  const now = Date.now();
+  const version = readPluginVersion();
+  const hr = `${ANSI.dim}${'─'.repeat(72)}${ANSI.reset}`;
+
+  process.stdout.write(
+    `\n${ANSI.bold}${ANSI.cyan}AGY Hub Pro v${version} — StatusLine Live Preview (--test)${ANSI.reset}\n` +
+      `${ANSI.dim}Dot style: ${ACTIVE_DOT_STYLE_NAME} │ ANSI color: ${USE_COLOR ? 'ON' : 'OFF (NO_COLOR)'} │ Zero disk writes${ANSI.reset}\n${hr}\n`
+  );
+
+  const scenarios = [
+    {
+      title: '1. Healthy (≤80% consumed · Green · Clean Git · High Cache)',
+      payload: {
+        terminal_width: 160,
+        model: { id: 'gemini-4-neon', display_name: 'Gemini 4 Neon', effort: 'high' },
+        context_window: {
+          context_window_size: 1_000_000,
+          used_tokens: 174_000,
+          used_percentage: 17.4,
+          current_usage: { input_tokens: 1_800, cache_read_input_tokens: 172_200 },
+          total_input_tokens: 240_000,
+          total_output_tokens: 44_000,
+        },
+        quota: {
+          'gemini-5h': { remaining_fraction: 0.79, reset_in_seconds: 4800 },
+          'gemini-weekly': { remaining_fraction: 0.73, reset_in_seconds: 457_200 },
+        },
+        workspace: { current_dir: '/workspace/agy-hub-pro' },
+        _mockGit: { branch: 'main', dirty: false, staged: 0, modified: 0, untracked: 0, ahead: 0, behind: 0, timedOut: false },
+        email: 'dev@example.com',
+        plan_tier: 'Google AI Pro',
+        cycle_mode: 'auto',
+        sandbox: { enabled: false },
+      },
+      state: {
+        version: 1,
+        quota: { remaining5h: 79, remainingWeek: 73, isEstimated: false, source: 'agy-stdin' },
+        usage: { tokens5h: 284_000, tokensWeek: 1_420_000 },
+        conversations: {},
+        ledger: [{ ts: now - 600_000, tokens: 284_000 }, { ts: now - 86_400_000, tokens: 1_136_000 }],
+      },
+    },
+    {
+      title: '2. Warning (>80% consumed · Yellow · Dirty Git + Sync · Fast Burn ⚡快)',
+      payload: {
+        terminal_width: 160,
+        model: { id: 'gemini-4-neon', display_name: 'Gemini 4 Neon', effort: 'xhigh' },
+        context_window: {
+          context_window_size: 1_000_000,
+          used_tokens: 842_000,
+          used_percentage: 84.2,
+          current_usage: { input_tokens: 353_600, cache_read_input_tokens: 488_400 },
+        },
+        quota: {
+          'gemini-5h': { remaining_fraction: 0.18, reset_in_seconds: 12_600 },
+          'gemini-weekly': { remaining_fraction: 0.16, reset_in_seconds: 172_800 },
+        },
+        workspace: { current_dir: '/workspace/agy-hub-pro' },
+        _mockGit: { branch: 'feat/hud-v2', dirty: true, staged: 2, modified: 3, untracked: 1, ahead: 2, behind: 0, timedOut: false },
+        email: 'dev@example.com',
+        plan_tier: 'Google AI Ultra',
+        cycle_mode: 'accept-edits',
+        sandbox: { enabled: true },
+      },
+      state: {
+        version: 1,
+        quota: { remaining5h: 18, remainingWeek: 16, isEstimated: false, source: 'agy-stdin' },
+        usage: { tokens5h: 4_120_000, tokensWeek: 33_600_000 },
+        conversations: {},
+        ledger: [{ ts: now - 900_000, tokens: 4_120_000 }, { ts: now - 172_800_000, tokens: 29_480_000 }],
+      },
+    },
+    {
+      title: '3. Critical (>90% consumed · Red · Local Estimate ~ · Narrow Width=92)',
+      payload: {
+        terminal_width: 92,
+        model: { id: 'gemini-4-hydrogen', display_name: 'Gemini 4 Hydrogen', effort: 'low' },
+        context_window: {
+          context_window_size: 1_000_000,
+          used_tokens: 935_000,
+          used_percentage: 93.5,
+          current_usage: { input_tokens: 701_250, cache_read_input_tokens: 233_750 },
+        },
+        workspace: { current_dir: '/tmp' },
+        _mockGit: null,
+        email: 'dev@example.com',
+        plan_tier: 'Google AI Pro',
+        cycle_mode: 'plan',
+        sandbox: { enabled: true },
+      },
+      state: {
+        version: 1,
+        quota: { remaining5h: 7, remainingWeek: 6, isEstimated: true, source: 'estimated' },
+        usage: { tokens5h: 4_650_000, tokensWeek: 37_600_000 },
+        conversations: {},
+        ledger: [{ ts: now - 300_000, tokens: 4_650_000 }, { ts: now - 86_400_000, tokens: 32_950_000 }],
+      },
+    },
+  ];
+
+  const t0 = performance.now();
+  for (const sc of scenarios) {
+    const out = renderDashboard(sc.payload, sc.state, { persist: false });
+    process.stdout.write(`\n${ANSI.bold}${sc.title}${ANSI.reset}\n`);
+    for (const line of out.trimEnd().split('\n')) {
+      process.stdout.write(`  ${line}\n`);
+    }
+  }
+  const elapsedMs = (performance.now() - t0).toFixed(1);
+
+  process.stdout.write(
+    `\n${hr}\n${ANSI.green}✓${ANSI.reset} Rendered ${scenarios.length} preview scenarios in ${ANSI.bold}${elapsedMs}ms${ANSI.reset} (exit 0).\n\n`
+  );
+}
+
+function inspectPathSafe(filePath) {
+  try {
+    const lstat = fs.lstatSync(filePath);
+    const isSymlink = lstat.isSymbolicLink();
+    let realPath = filePath;
+    let brokenSymlink = false;
+    if (isSymlink) {
+      try {
+        realPath = fs.realpathSync(filePath);
+      } catch {
+        brokenSymlink = true;
+      }
+    }
+    return { exists: true, accessible: true, isSymlink, realPath, brokenSymlink, errorCode: null };
+  } catch (err) {
+    if (err && (err.code === 'EACCES' || err.code === 'EPERM')) {
+      return { exists: false, accessible: false, isSymlink: false, realPath: filePath, brokenSymlink: false, errorCode: err.code };
+    }
+    return { exists: false, accessible: true, isSymlink: false, realPath: filePath, brokenSymlink: false, errorCode: err?.code || 'ENOENT' };
+  }
+}
+
+function runDoctor(asJson = false) {
+  const version = readPluginVersion();
+  const checks = [];
+  const addCheck = (id, name, status, detail, fix = null) => {
+    checks.push({ id, name, status, detail, fix });
+  };
+
+  // 1. Node.js Runtime Version
+  const nodeMajor = Number(process.versions.node.split('.')[0]);
+  if (nodeMajor >= 18) {
+    addCheck('node', 'Node.js Runtime', 'pass', `${process.version} (${process.execPath})`);
+  } else {
+    addCheck(
+      'node',
+      'Node.js Runtime',
+      'fail',
+      `${process.version} is below minimum required v18.0.0`,
+      'Upgrade Node.js to v18+ (recommended: v20/v22 LTS).'
+    );
+  }
+
+  // 2. Self-Contained Plugin Integrity & Permissions
+  const requiredFiles = ['plugin.json', 'hooks.json', 'statusline.mjs', 'collector.mjs'];
+  const missingFiles = requiredFiles.filter((f) => !fs.existsSync(path.join(PLUGIN_DIR, f)));
+  const nonExecScripts = ['statusline.mjs', 'collector.mjs'].filter((f) => {
+    try {
+      fs.accessSync(path.join(PLUGIN_DIR, f), fs.constants.X_OK);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  let manifestError = null;
+  for (const jf of ['plugin.json', 'hooks.json']) {
+    try {
+      JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, jf), 'utf8'));
+    } catch (e) {
+      manifestError = `${jf}: ${e.message}`;
+    }
+  }
+  const hasNodeModules = fs.existsSync(path.join(PLUGIN_DIR, 'node_modules'));
+
+  if (missingFiles.length > 0 || manifestError) {
+    addCheck(
+      'plugin_files',
+      'Plugin Integrity',
+      'fail',
+      missingFiles.length > 0
+        ? `Missing files in ${PLUGIN_DIR}: ${missingFiles.join(', ')}`
+        : `Invalid JSON in ${manifestError}`,
+      'Re-clone or reinstall agy-hub-pro from GitHub.'
+    );
+  } else if (nonExecScripts.length > 0) {
+    addCheck(
+      'plugin_files',
+      'Plugin Integrity',
+      'warn',
+      `Scripts missing +x bit: ${nonExecScripts.join(', ')} (root: ${PLUGIN_DIR})`,
+      `Run: chmod +x "${path.join(PLUGIN_DIR, 'statusline.mjs')}" "${path.join(PLUGIN_DIR, 'collector.mjs')}"`
+    );
+  } else {
+    addCheck(
+      'plugin_files',
+      'Plugin Integrity',
+      'pass',
+      `Self-contained zero-dependency ESM in ${PLUGIN_DIR}${hasNodeModules ? ' (note: unused node_modules/ present)' : ''}`
+    );
+  }
+
+  // 3. Git Availability
+  try {
+    const t0 = performance.now();
+    const gitVer = execFileSync('git', ['--version'], {
+      timeout: 1000,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const ms = Math.round(performance.now() - t0);
+    addCheck('git', 'Git Command', 'pass', `${gitVer} (${ms}ms)`);
+  } catch {
+    addCheck(
+      'git',
+      'Git Command',
+      'warn',
+      'git binary not found in PATH (StatusLine will fall back to reading .git/HEAD directly)',
+      'Install Git (e.g. xcode-select --install on macOS or apt install git on Linux).'
+    );
+  }
+
+  // 4. Antigravity CLI (agy)
+  try {
+    const agyVer = execFileSync('agy', ['--version'], {
+      timeout: 1500,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+      .trim()
+      .split(/\r?\n/)[0];
+    addCheck('agy_cli', 'Antigravity CLI (agy)', 'pass', agyVer || 'Detected in PATH');
+  } catch {
+    addCheck(
+      'agy_cli',
+      'Antigravity CLI (agy)',
+      'warn',
+      'agy command not found in PATH',
+      'Install Antigravity CLI or ensure it is on your PATH before running agy plugin install.'
+    );
+  }
+
+  // 5. Active Settings File Detection & StatusLine Mount Check
+  const home = os.homedir();
+  const explicitSettings = process.env.AGY_HUB_SETTINGS_FILE || '';
+  const settingsCandidates = explicitSettings
+    ? [explicitSettings]
+    : [
+        path.join(home, '.gemini', 'antigravity-cli', 'settings.json'),
+        path.join(home, '.gemini', 'settings.json'),
+      ];
+
+  const inspected = settingsCandidates.map((p) => ({ path: p, ...inspectPathSafe(p) }));
+  const existingSettings = inspected.filter((i) => i.exists);
+  const blockedSettings = inspected.filter((i) => !i.accessible);
+
+  if (existingSettings.length === 0) {
+    if (blockedSettings.length > 0) {
+      addCheck(
+        'settings_mount',
+        'Settings & StatusLine Mount',
+        'warn',
+        `Cannot inspect ${blockedSettings.map((b) => b.path).join(', ')} (${blockedSettings[0].errorCode}: restricted environment)`,
+        'Run `node statusline.mjs --doctor` outside a restricted sandbox to verify ~/.gemini/antigravity-cli/settings.json.'
+      );
+    } else {
+      addCheck(
+        'settings_mount',
+        'Settings & StatusLine Mount',
+        'fail',
+        `No settings.json found at ${settingsCandidates.join(' or ')}`,
+        `Run \`${path.join(PLUGIN_DIR, 'install.sh')} --install\` to safely create and configure settings.json.`
+      );
+    }
+  } else {
+    const primary = existingSettings[0];
+    const multiDistinct =
+      existingSettings.length > 1 &&
+      existingSettings[0].realPath !== existingSettings[1].realPath;
+
+    if (primary.brokenSymlink) {
+      addCheck(
+        'settings_mount',
+        'Settings & StatusLine Mount',
+        'fail',
+        `Broken symlink detected at ${primary.path}`,
+        `Fix or remove the broken symlink at ${primary.path}, then re-run ./install.sh --install.`
+      );
+    } else {
+      try {
+        const cfg = JSON.parse(fs.readFileSync(primary.realPath, 'utf8'));
+        const sl = cfg?.statusLine;
+        const linkNote = primary.isSymlink ? ` -> ${primary.realPath}` : '';
+        const multiNote = multiDistinct
+          ? ` (also found ${existingSettings[1].path}; primary is active for agy CLI)`
+          : '';
+
+        if (!sl || typeof sl !== 'object' || !sl.command) {
+          addCheck(
+            'settings_mount',
+            'Settings & StatusLine Mount',
+            'fail',
+            `statusLine is not configured in ${primary.path}${linkNote}${multiNote}`,
+            `Run \`${path.join(PLUGIN_DIR, 'install.sh')} --install\` or inside agy run: /statusline node ${__filename}`
+          );
+        } else if (sl.enabled === false) {
+          addCheck(
+            'settings_mount',
+            'Settings & StatusLine Mount',
+            'warn',
+            `statusLine is configured in ${primary.path}${linkNote} but "enabled": false`,
+            'Set "statusLine.enabled": true or run `/statusline enable` inside agy.'
+          );
+        } else {
+          const cmd = String(sl.command);
+          const scriptMatch = cmd.match(/([^\s"']*statusline\.mjs)/);
+          const mountedScript = scriptMatch
+            ? scriptMatch[1].replace(/^~(?=\/)/, home)
+            : null;
+          if (!mountedScript) {
+            addCheck(
+              'settings_mount',
+              'Settings & StatusLine Mount',
+              'warn',
+              `statusLine in ${primary.path}${linkNote} points to another command: ${cmd}`,
+              `Run \`${path.join(PLUGIN_DIR, 'install.sh')} --install\` if you want to switch to agy-hub-pro.`
+            );
+          } else if (!fs.existsSync(mountedScript)) {
+            addCheck(
+              'settings_mount',
+              'Settings & StatusLine Mount',
+              'fail',
+              `statusLine in ${primary.path}${linkNote} points to missing file: ${mountedScript}`,
+              `Re-run \`${path.join(PLUGIN_DIR, 'install.sh')} --install\` to repair the path.`
+            );
+          } else {
+            const realMounted = fs.realpathSync(mountedScript);
+            const realSelf = fs.realpathSync(__filename);
+            const sameTarget = realMounted === realSelf;
+            addCheck(
+              'settings_mount',
+              'Settings & StatusLine Mount',
+              sameTarget ? 'pass' : 'warn',
+              sameTarget
+                ? `Mounted in ${primary.path}${linkNote}${multiNote}`
+                : `Mounted in ${primary.path}${linkNote} -> ${mountedScript} (differs from current checkout ${__filename})`,
+              sameTarget
+                ? null
+                : `Run \`${path.join(PLUGIN_DIR, 'install.sh')} --install\` to point settings.json to this directory.`
+            );
+          }
+        }
+      } catch (err) {
+        addCheck(
+          'settings_mount',
+          'Settings & StatusLine Mount',
+          'fail',
+          `Failed to parse ${primary.path}: ${err.message}`,
+          `Fix the JSON syntax error in ${primary.realPath} before running ./install.sh --install.`
+        );
+      }
+    }
+  }
+
+  // 6. Lifecycle Hooks Registration Check
+  const globalHooksPath =
+    process.env.AGY_HUB_HOOKS_FILE || path.join(home, '.gemini', 'config', 'hooks.json');
+  const globalHooksInfo = inspectPathSafe(globalHooksPath);
+  const installedPluginHooks = path.join(home, '.gemini', 'plugins', 'agy-hub-pro', 'hooks.json');
+  const pluginHooksInfo = inspectPathSafe(installedPluginHooks);
+
+  let hooksRegistered = false;
+  let hooksDetail = '';
+  if (globalHooksInfo.exists) {
+    const gh = safeReadJson(globalHooksInfo.realPath);
+    if (gh && (gh['agy-hub-pro'] || gh['agy-hud-pro'])) {
+      hooksRegistered = true;
+      const key = gh['agy-hub-pro'] ? 'agy-hub-pro' : 'agy-hud-pro';
+      hooksDetail = `Registered under "${key}" in ${globalHooksPath}`;
+      if (gh['agy-hub-pro'] && gh['agy-hud-pro']) {
+        addCheck(
+          'hooks',
+          'Lifecycle Hooks',
+          'warn',
+          `Both "agy-hub-pro" and legacy "agy-hud-pro" exist in ${globalHooksPath} (duplicate hooks)`,
+          `Run \`${path.join(PLUGIN_DIR, 'install.sh')} --install\` to clean up the legacy entry.`
+        );
+        hooksRegistered = null; // already recorded
+      }
+    }
+  }
+  if (hooksRegistered === false && pluginHooksInfo.exists) {
+    hooksRegistered = true;
+    hooksDetail = `Native plugin hooks present at ${installedPluginHooks}`;
+  }
+  if (hooksRegistered === true) {
+    addCheck('hooks', 'Lifecycle Hooks', 'pass', hooksDetail);
+  } else if (hooksRegistered === false) {
+    const blocked = !globalHooksInfo.accessible || !pluginHooksInfo.accessible;
+    addCheck(
+      'hooks',
+      'Lifecycle Hooks',
+      'warn',
+      blocked
+        ? 'Could not inspect global hooks directory (restricted sandbox)'
+        : 'Not registered in ~/.gemini/config/hooks.json or ~/.gemini/plugins/agy-hub-pro/hooks.json',
+      'Run `agy plugin install bangbangda/agy-hub-pro` or `./install.sh --install` to enable SessionStart/Stop/PreInvocation hooks.'
+    );
+  }
+
+  // 7. Data & Cache Directory Read/Write Permissions + State/Lock Health
+  const probeFile = path.join(DATA_DIR, `.doctor-probe-${process.pid}-${Date.now()}.tmp`);
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(probeFile, 'ok\n', 'utf8');
+    const content = fs.readFileSync(probeFile, 'utf8').trim();
+    fs.unlinkSync(probeFile);
+    if (content !== 'ok') throw new Error('Readback mismatch');
+
+    let extra = RESOLVED_DATA.isFallback
+      ? ` (fallback tmpdir; ${DEFAULT_DATA_DIR} not writable)`
+      : '';
+    if (fs.existsSync(STATE_FILE)) {
+      const st = safeReadJson(STATE_FILE);
+      if (!st) {
+        addCheck(
+          'data_dir',
+          'Data & Cache Directory',
+          'warn',
+          `Writable (${DATA_DIR}), but ${STATE_FILE} contains invalid JSON`,
+          `Remove corrupted cache: rm -f "${STATE_FILE}"`
+        );
+      } else {
+        const entries = Array.isArray(st.ledger) ? st.ledger.length : 0;
+        addCheck(
+          'data_dir',
+          'Data & Cache Directory',
+          RESOLVED_DATA.isFallback ? 'warn' : 'pass',
+          `Read/Write OK: ${DATA_DIR}${extra} (state.json: ${entries} ledger entries)`,
+          RESOLVED_DATA.isFallback
+            ? `Ensure ${DEFAULT_DATA_DIR} is writable so state persists across reboots.`
+            : null
+        );
+      }
+    } else {
+      addCheck(
+        'data_dir',
+        'Data & Cache Directory',
+        RESOLVED_DATA.isFallback ? 'warn' : 'pass',
+        `Read/Write OK: ${DATA_DIR}${extra} (state.json will initialize on first run)`,
+        RESOLVED_DATA.isFallback
+          ? `Ensure ${DEFAULT_DATA_DIR} is writable so state persists across reboots.`
+          : null
+      );
+    }
+  } catch (err) {
+    addCheck(
+      'data_dir',
+      'Data & Cache Directory',
+      'fail',
+      `Cannot write to ${DATA_DIR}: ${err.message}`,
+      `Fix permissions: mkdir -p "${DEFAULT_DATA_DIR}" && chmod 755 "${DEFAULT_DATA_DIR}"`
+    );
+  }
+
+  // Check for stale collector.lock
+  if (fs.existsSync(LOCK_FILE)) {
+    try {
+      const ageSec = Math.round((Date.now() - fs.statSync(LOCK_FILE).mtimeMs) / 1000);
+      if (ageSec > 60) {
+        addCheck(
+          'lock_file',
+          'Collector Lock',
+          'warn',
+          `Stale lock file detected (${LOCK_FILE}, age ${ageSec}s)`,
+          `Remove stale lock: rm -f "${LOCK_FILE}"`
+        );
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const fails = checks.filter((c) => c.status === 'fail');
+  const warns = checks.filter((c) => c.status === 'warn');
+
+  if (asJson) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          version,
+          pluginDir: PLUGIN_DIR,
+          dataDir: DATA_DIR,
+          ok: fails.length === 0,
+          passed: checks.filter((c) => c.status === 'pass').length,
+          warnings: warns.length,
+          failures: fails.length,
+          checks,
+        },
+        null,
+        2
+      )}\n`
+    );
+    process.exit(fails.length > 0 ? 1 : 0);
+  }
+
+  const hr = `${ANSI.dim}${'─'.repeat(72)}${ANSI.reset}`;
+  process.stdout.write(
+    `\n${ANSI.bold}${ANSI.cyan}AGY Hub Pro v${version} — Diagnostics (--doctor)${ANSI.reset}\n${hr}\n`
+  );
+
+  for (const c of checks) {
+    let badge;
+    if (c.status === 'pass') badge = `${ANSI.green}✓ PASS${ANSI.reset}`;
+    else if (c.status === 'warn') badge = `${ANSI.yellow}⚠ WARN${ANSI.reset}`;
+    else badge = `${ANSI.red}✗ FAIL${ANSI.reset}`;
+    process.stdout.write(`  ${badge}  ${ANSI.bold}${c.name}${ANSI.reset}: ${c.detail}\n`);
+    if (c.fix) {
+      process.stdout.write(`          ${ANSI.dim}↳ Fix: ${c.fix}${ANSI.reset}\n`);
+    }
+  }
+
+  process.stdout.write(`${hr}\n`);
+  if (fails.length === 0 && warns.length === 0) {
+    process.stdout.write(`${ANSI.green}${ANSI.bold}All checks passed! AGY Hub Pro is ready.${ANSI.reset}\n\n`);
+  } else if (fails.length === 0) {
+    process.stdout.write(
+      `${ANSI.yellow}${ANSI.bold}Checks completed with ${warns.length} warning(s) and 0 failure(s).${ANSI.reset}\n\n`
+    );
+  } else {
+    process.stdout.write(
+      `${ANSI.red}${ANSI.bold}${fails.length} check(s) failed, ${warns.length} warning(s). Follow the Fix hints above.${ANSI.reset}\n\n`
+    );
+  }
+
+  process.exit(fails.length > 0 ? 1 : 0);
+}
+
+function printHelp() {
+  const version = readPluginVersion();
+  process.stdout.write(
+    `AGY Hub Pro v${version} — Zero-Dependency Antigravity CLI StatusLine\n\n` +
+      `Usage:\n` +
+      `  <json> | node statusline.mjs         Render live 2-line ANSI HUD from agy stdin\n` +
+      `  node statusline.mjs --test           Preview ANSI HUD layout with simulated session JSON\n` +
+      `  node statusline.mjs --doctor         Diagnose Node, Git, config mounts, and cache permissions\n` +
+      `  node statusline.mjs --doctor --json  Output diagnostics as machine-readable JSON\n` +
+      `  node statusline.mjs --version        Print plugin version\n` +
+      `  node statusline.mjs --help           Show this help message\n\n` +
+      `Environment Variables:\n` +
+      `  AGY_HUB_DOT_STYLE       bullseye | pill | small | square | diamond | classic\n` +
+      `  AGY_HUB_DATA_DIR        Override data directory (default: ~/.gemini/plugins/agy-hub-pro/data)\n` +
+      `  AGY_HUB_GIT_TIMEOUT_MS  Git status timeout in ms (default: 150)\n` +
+      `  AGY_HUB_SHOW_NON_GIT    Set to 1 to show git:- outside Git repositories\n` +
+      `  NO_COLOR                Set to any non-empty value to disable ANSI colors\n`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main entrypoint
+// ---------------------------------------------------------------------------
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    printHelp();
+    return;
+  }
+  if (args.includes('--version') || args.includes('-v')) {
+    process.stdout.write(`agy-hub-pro v${readPluginVersion()}\n`);
+    return;
+  }
+  if (args.includes('--test')) {
+    runTestPreview();
+    return;
+  }
+  if (args.includes('--doctor')) {
+    runDoctor(args.includes('--json'));
+    return;
+  }
+
+  const payload = await readAndSniffStdin();
+  const existingState = readStateCache();
+  const rendered = renderDashboard(payload, existingState, { persist: true });
+  process.stdout.write(rendered);
 }
 
 main().catch(() => {

@@ -28,13 +28,18 @@ jobs:
           test -x statusline.mjs
           test -x collector.mjs
           test -x install.sh
+          test -x uninstall.sh
+          test ! -d node_modules
+          test ! -d data
           test ! -f state.json
           test ! -f collector.lock
 
-      - name: Check Node.js ESM syntax
+      - name: Check Node.js ESM & Shell syntax
         run: |
           node --check statusline.mjs
           node --check collector.mjs
+          bash -n install.sh
+          bash -n uninstall.sh
 
       - name: Validate JSON configuration files
         run: |
@@ -47,5 +52,8 @@ jobs:
             }
           '
 
-      - name: Run full simulation test suite
+      - name: Verify built-in CLI preview (--test)
+        run: node statusline.mjs --test
+
+      - name: Run full simulation, deep-merge, doctor & uninstall test suite
         run: ./install.sh --test

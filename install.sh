@@ -1,51 +1,173 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# agy-hud-pro / install.sh
+# agy-hub-pro / install.sh
 #
-# 一键权限设置、配置合并安装（带自动备份）与全链路模拟测试脚本
-# 用法:
-#   ./install.sh --test       # 仅赋予可执行权限并运行全链路模拟测试（不修改真实 settings.json）
-#   ./install.sh --preview    # 预览将写入 settings.json 与 hooks.json 的配置内容
-#   ./install.sh --install    # 备份原配置并写入 ~/.gemini/antigravity-cli/settings.json + 安装插件/钩子
-#   ./install.sh              # 默认执行 --test 并展示安装指引
+# Zero-dependency installer, safe deep-merge config manager, uninstaller,
+# diagnostics runner, and end-to-end simulation test suite.
+#
+# One-line remote install:
+#   curl -fsSL https://raw.githubusercontent.com/bangbangda/agy-hub-pro/main/install.sh | bash
+#
+# Local usage:
+#   ./install.sh --install     # Backup + deep-merge settings.json & register hooks
+#   ./install.sh --uninstall   # Cleanly remove statusLine & hooks (preserves all other config)
+#   ./install.sh --doctor      # Run built-in environment & mount diagnostics
+#   ./install.sh --test        # Run full simulation & deep-merge/uninstall test suite
+#   ./install.sh --preview     # Preview config merge snippets without modifying files
+#   ./install.sh --help        # Show usage
 # ==============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STATUSLINE_SCRIPT="${SCRIPT_DIR}/statusline.mjs"
-COLLECTOR_SCRIPT="${SCRIPT_DIR}/collector.mjs"
-SETTINGS_FILE="${HOME}/.gemini/antigravity-cli/settings.json"
-SETTINGS_BACKUP="${HOME}/.gemini/antigravity-cli/settings.json.bak"
-GLOBAL_HOOKS_FILE="${HOME}/.gemini/config/hooks.json"
-GLOBAL_HOOKS_BACKUP="${HOME}/.gemini/config/hooks.json.bak"
+REPO_URL="${AGY_HUB_REPO_URL:-https://github.com/bangbangda/agy-hub-pro.git}"
+REPO_BRANCH="${AGY_HUB_BRANCH:-main}"
+DEFAULT_INSTALL_DIR="${AGY_HUB_INSTALL_DIR:-${HOME}/.gemini/plugins/agy-hub-pro}"
 
 BOLD=$'\033[1m'
 CYAN=$'\033[36m'
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
+RED=$'\033[1;31m'
 DIM=$'\033[2m'
 RESET=$'\033[0m'
 
-log_header() {
-  printf "\n${BOLD}${CYAN}▶ %s${RESET}\n" "$1"
+log_header() { printf "\n${BOLD}${CYAN}▶ %s${RESET}\n" "$1"; }
+log_ok()     { printf "${GREEN}✓${RESET} %s\n" "$1"; }
+log_warn()   { printf "${YELLOW}!${RESET} %s\n" "$1"; }
+log_err()    { printf "${RED}✗${RESET} %s\n" "$1" >&2; }
+
+# Detect whether running from a local repository checkout or piped via curl | bash
+REMOTE_MODE=0
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+
+if [[ -z "${SCRIPT_DIR}" || ! -f "${SCRIPT_DIR}/statusline.mjs" || ! -f "${SCRIPT_DIR}/collector.mjs" ]]; then
+  REMOTE_MODE=1
+  SCRIPT_DIR="${DEFAULT_INSTALL_DIR}"
+fi
+
+STATUSLINE_SCRIPT="${SCRIPT_DIR}/statusline.mjs"
+COLLECTOR_SCRIPT="${SCRIPT_DIR}/collector.mjs"
+
+check_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    log_err "Node.js is required (>= 18.0.0) but was not found in PATH."
+    log_err "Please install Node.js from https://nodejs.org/ and retry."
+    exit 1
+  fi
+  local major
+  major="$(node -p 'process.versions.node.split(".")[0]')"
+  if (( major < 18 )); then
+    log_err "Node.js v18+ is required (detected: $(node -v))."
+    exit 1
+  fi
 }
 
-log_ok() {
-  printf "${GREEN}✓${RESET} %s\n" "$1"
-}
+bootstrap_remote_repo() {
+  log_header "Downloading agy-hub-pro to ${SCRIPT_DIR}"
+  mkdir -p "$(dirname "${SCRIPT_DIR}")"
 
-log_warn() {
-  printf "${YELLOW}!${RESET} %s\n" "$1"
+  if command -v git >/dev/null 2>&1; then
+    if [[ -d "${SCRIPT_DIR}/.git" ]]; then
+      log_ok "Existing installation found at ${SCRIPT_DIR}; pulling latest updates..."
+      if git -C "${SCRIPT_DIR}" pull --ff-only origin "${REPO_BRANCH}" >/dev/null 2>&1; then
+        log_ok "Updated ${SCRIPT_DIR} to latest ${REPO_BRANCH}."
+      else
+        log_warn "Could not fast-forward ${SCRIPT_DIR}; continuing with existing files."
+      fi
+    else
+      if [[ -d "${SCRIPT_DIR}" && -n "$(ls -A "${SCRIPT_DIR}" 2>/dev/null || true)" ]]; then
+        local backup_dir="${SCRIPT_DIR}.bak.$(date +%Y%m%d%H%M%S)"
+        mv "${SCRIPT_DIR}" "${backup_dir}"
+        log_warn "Moved existing non-git directory to ${backup_dir}"
+      fi
+      git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${SCRIPT_DIR}"
+      log_ok "Cloned agy-hub-pro into ${SCRIPT_DIR}"
+    fi
+  elif command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+    local archive_url="https://github.com/bangbangda/agy-hub-pro/archive/refs/heads/${REPO_BRANCH}.tar.gz"
+    local tmp_extract
+    tmp_extract="$(mktemp -d)"
+    curl -fsSL "${archive_url}" | tar -xz -C "${tmp_extract}"
+    mkdir -p "${SCRIPT_DIR}"
+    cp -R "${tmp_extract}"/agy-hub-pro-*/* "${SCRIPT_DIR}/"
+    rm -rf "${tmp_extract}"
+    log_ok "Downloaded and extracted agy-hub-pro to ${SCRIPT_DIR}"
+  else
+    log_err "Neither git nor curl+tar is available to download agy-hub-pro."
+    exit 1
+  fi
+
+  STATUSLINE_SCRIPT="${SCRIPT_DIR}/statusline.mjs"
+  COLLECTOR_SCRIPT="${SCRIPT_DIR}/collector.mjs"
 }
 
 ensure_executable() {
-  log_header "1. 赋予脚本可执行权限"
-  chmod +x "${STATUSLINE_SCRIPT}" "${COLLECTOR_SCRIPT}" "${SCRIPT_DIR}/install.sh"
-  log_ok "chmod +x: statusline.mjs, collector.mjs, install.sh"
+  log_header "1. Setting executable permissions"
+  chmod +x "${STATUSLINE_SCRIPT}" "${COLLECTOR_SCRIPT}"
+  [[ -f "${SCRIPT_DIR}/install.sh" ]] && chmod +x "${SCRIPT_DIR}/install.sh"
+  [[ -f "${SCRIPT_DIR}/uninstall.sh" ]] && chmod +x "${SCRIPT_DIR}/uninstall.sh"
+  log_ok "chmod +x applied to scripts in ${SCRIPT_DIR}"
+}
+
+detect_settings_file() {
+  node - <<'NODE_EOF'
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const explicit = process.env.AGY_HUB_SETTINGS_FILE || '';
+const home = os.homedir();
+const primary = path.join(home, '.gemini', 'antigravity-cli', 'settings.json');
+const secondary = path.join(home, '.gemini', 'settings.json');
+const candidates = explicit ? [explicit] : [primary, secondary];
+
+function inspect(p) {
+  try {
+    const lstat = fs.lstatSync(p);
+    const isSymlink = lstat.isSymbolicLink();
+    let realPath = p;
+    if (isSymlink) {
+      try { realPath = fs.realpathSync(p); } catch { /* broken symlink */ }
+    }
+    return { path: p, exists: true, isSymlink, realPath };
+  } catch {
+    return { path: p, exists: false, isSymlink: false, realPath: p };
+  }
+}
+
+const info = candidates.map(inspect);
+const existing = info.filter((i) => i.exists);
+let selected;
+let note = '';
+
+if (existing.length === 0) {
+  selected = info[0];
+  note = 'new';
+} else if (existing.length === 1) {
+  selected = existing[0];
+  note = selected.isSymlink ? `symlink->${selected.realPath}` : 'existing';
+} else {
+  selected = existing[0];
+  if (existing[0].realPath === existing[1].realPath) {
+    note = `shared-symlink->${selected.realPath}`;
+  } else {
+    note = `multi-distinct(primary=${existing[0].path},secondary=${existing[1].path})`;
+  }
+}
+
+process.stdout.write(JSON.stringify({ ...selected, note }));
+NODE_EOF
 }
 
 preview_config() {
-  log_header "配置预览：~/.gemini/antigravity-cli/settings.json (statusLine 合并片段)"
+  check_node
+  local detected target_path
+  detected="$(detect_settings_file)"
+  target_path="$(node -e 'console.log(JSON.parse(process.argv[1]).path)' "${detected}")"
+
+  log_header "Config preview: ${target_path} (deep-merged statusLine block)"
   cat <<EOF
 {
   "statusLine": {
@@ -58,101 +180,334 @@ preview_config() {
 }
 EOF
 
-  log_header "配置预览：插件根目录 hooks.json（或合并至 ~/.gemini/config/hooks.json）"
+  log_header "Config preview: plugin root hooks.json (auto-loaded by agy plugin install)"
   cat "${SCRIPT_DIR}/hooks.json"
 }
 
 install_config() {
+  check_node
+  if [[ "${REMOTE_MODE}" -eq 1 ]]; then
+    bootstrap_remote_repo
+  fi
+
   ensure_executable
 
-  log_header "2. 备份并合并 ~/.gemini/antigravity-cli/settings.json"
-  mkdir -p "$(dirname "${SETTINGS_FILE}")"
-  if [[ -f "${SETTINGS_FILE}" ]]; then
-    cp "${SETTINGS_FILE}" "${SETTINGS_BACKUP}"
-    log_ok "已备份原配置至: ${SETTINGS_BACKUP}"
-  else
-    log_warn "未检测到已有 settings.json，将新建配置文件"
-  fi
+  local ts detected target_path real_path note
+  ts="$(date +%Y%m%d%H%M%S)"
+  detected="$(detect_settings_file)"
+  target_path="$(node -e 'console.log(JSON.parse(process.argv[1]).path)' "${detected}")"
+  real_path="$(node -e 'console.log(JSON.parse(process.argv[1]).realPath)' "${detected}")"
+  note="$(node -e 'console.log(JSON.parse(process.argv[1]).note)' "${detected}")"
 
-  node - "${SETTINGS_FILE}" "${STATUSLINE_SCRIPT}" <<'NODE_EOF'
+  log_header "2. Auto-detect & safely deep-merge settings.json"
+  printf "  ${DIM}Detected active config: %s (%s)${RESET}\n" "${target_path}" "${note}"
+
+  node - "${target_path}" "${real_path}" "${STATUSLINE_SCRIPT}" "${ts}" <<'NODE_EOF'
 const fs = require('node:fs');
-const [settingsPath, statuslineScript] = process.argv.slice(2);
-let cfg = {};
-try {
-  cfg = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-} catch {
-  cfg = {};
-}
-cfg.statusLine = {
-  type: 'command',
-  command: `node ${statuslineScript}`,
-  enabled: true,
-  padding: 0,
-  stack_with_default: false,
-};
-fs.writeFileSync(settingsPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
-NODE_EOF
-  log_ok "已写入 statusLine 配置至: ${SETTINGS_FILE}"
+const path = require('node:path');
 
-  log_header "3. 注册生命周期钩子（优先 agy plugin install，否则合并至 ~/.gemini/config/hooks.json）"
-  if command -v agy >/dev/null 2>&1; then
-    echo "${DIM}运行: agy plugin install ${SCRIPT_DIR}${RESET}"
+const [targetPath, realPath, statuslineScript, ts] = process.argv.slice(2);
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function deepMerge(target, source) {
+  const out = isPlainObject(target) ? { ...target } : {};
+  for (const [k, v] of Object.entries(source)) {
+    if (isPlainObject(v) && isPlainObject(out[k])) {
+      out[k] = deepMerge(out[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+const writeTarget = realPath || targetPath;
+fs.mkdirSync(path.dirname(writeTarget), { recursive: true });
+
+let existing = {};
+let fileMode = 0o644;
+if (fs.existsSync(writeTarget)) {
+  const stat = fs.statSync(writeTarget);
+  fileMode = stat.mode & 0o777;
+  const raw = fs.readFileSync(writeTarget, 'utf8');
+  if (raw.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (!isPlainObject(parsed)) {
+        throw new Error('Root JSON value must be an object');
+      }
+      existing = parsed;
+    } catch (err) {
+      console.error(`ERROR: Existing settings file has invalid JSON (${writeTarget}): ${err.message}`);
+      console.error('Refusing to overwrite to prevent data loss. Fix the JSON syntax and retry.');
+      process.exit(2);
+    }
+  }
+  const backupPath = `${writeTarget}.bak.${ts}`;
+  fs.copyFileSync(writeTarget, backupPath);
+  console.log(`BACKUP:${backupPath}`);
+}
+
+const patch = {
+  statusLine: {
+    type: 'command',
+    command: `node ${statuslineScript}`,
+    enabled: true,
+    padding: 0,
+    stack_with_default: false,
+  },
+};
+
+const merged = deepMerge(existing, patch);
+const tmpPath = `${writeTarget}.${process.pid}.${Date.now()}.tmp`;
+fs.writeFileSync(tmpPath, `${JSON.stringify(merged, null, 2)}\n`, { encoding: 'utf8', mode: fileMode });
+fs.renameSync(tmpPath, writeTarget);
+console.log(`WRITTEN:${writeTarget}`);
+NODE_EOF
+
+  log_ok "Deep-merged statusLine into ${target_path} (all existing settings preserved)"
+
+  log_header "3. Register lifecycle hooks (SessionStart / PreInvocation / Stop)"
+  local global_hooks_file="${AGY_HUB_HOOKS_FILE:-${HOME}/.gemini/config/hooks.json}"
+  local plugin_installed=0
+
+  if [[ "${AGY_HUB_SKIP_AGY_CLI:-0}" != "1" ]] && command -v agy >/dev/null 2>&1; then
+    printf "  ${DIM}Running: agy plugin install %s${RESET}\n" "${SCRIPT_DIR}"
     if agy plugin install "${SCRIPT_DIR}"; then
-      log_ok "已通过 agy plugin install 注册插件与生命周期钩子！"
-      return 0
+      log_ok "Registered native Antigravity plugin via agy plugin install"
+      plugin_installed=1
     else
-      log_warn "agy plugin install 返回非零退出码，回退至全局 ~/.gemini/config/hooks.json 合并写入..."
+      log_warn "agy plugin install returned non-zero; falling back to global hooks.json deep merge..."
     fi
   else
-    log_warn "当前 PATH 未找到 agy 命令，直接合并写入全局 ~/.gemini/config/hooks.json..."
+    log_warn "Skipping agy plugin install; merging lifecycle hooks into ${global_hooks_file}..."
   fi
 
-  mkdir -p "$(dirname "${GLOBAL_HOOKS_FILE}")"
-  if [[ -f "${GLOBAL_HOOKS_FILE}" ]]; then
-    cp "${GLOBAL_HOOKS_FILE}" "${GLOBAL_HOOKS_BACKUP}"
-    log_ok "已备份原 hooks.json 至: ${GLOBAL_HOOKS_BACKUP}"
-  fi
-
-  node - "${GLOBAL_HOOKS_FILE}" "${COLLECTOR_SCRIPT}" <<'NODE_EOF'
+  # If native plugin install succeeded, still clean up any legacy agy-hud-pro entry in global hooks.json
+  # to prevent duplicate hook execution; otherwise deep-merge agy-hub-pro into global hooks.json.
+  node - "${global_hooks_file}" "${COLLECTOR_SCRIPT}" "${ts}" "${plugin_installed}" <<'NODE_EOF'
 const fs = require('node:fs');
-const [hooksPath, collectorScript] = process.argv.slice(2);
-let hooks = {};
-try {
-  hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
-} catch {
-  hooks = {};
+const path = require('node:path');
+
+const [hooksPath, collectorScript, ts, pluginInstalledFlag] = process.argv.slice(2);
+const pluginInstalled = pluginInstalledFlag === '1';
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
-hooks['agy-hud-pro'] = {
-  enabled: true,
-  SessionStart: [
-    { type: 'command', command: `node ${collectorScript} --event SessionStart`, timeout: 5 }
-  ],
-  PreInvocation: [
-    { type: 'command', command: `node ${collectorScript} --event PreInvocation`, timeout: 5 }
-  ],
-  Stop: [
-    { type: 'command', command: `node ${collectorScript} --event Stop`, timeout: 5 }
-  ],
+
+let realHooksPath = hooksPath;
+if (fs.existsSync(hooksPath)) {
+  try { realHooksPath = fs.realpathSync(hooksPath); } catch { /* ignore */ }
+}
+
+let existing = {};
+let hadFile = fs.existsSync(realHooksPath);
+if (hadFile) {
+  const raw = fs.readFileSync(realHooksPath, 'utf8');
+  if (raw.trim().length > 0) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (!isPlainObject(parsed)) throw new Error('Root JSON value must be an object');
+      existing = parsed;
+    } catch (err) {
+      console.error(`ERROR: Existing hooks.json has invalid JSON (${realHooksPath}): ${err.message}`);
+      process.exit(2);
+    }
+  }
+}
+
+if (pluginInstalled) {
+  // Only touch global hooks.json if stale legacy entry exists
+  if (existing['agy-hud-pro'] || existing['agy-hub-pro']) {
+    const backupPath = `${realHooksPath}.bak.${ts}`;
+    fs.copyFileSync(realHooksPath, backupPath);
+    delete existing['agy-hud-pro'];
+    delete existing['agy-hub-pro'];
+    const tmp = `${realHooksPath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(existing, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, realHooksPath);
+    console.log(`CLEANED_DUPLICATE_GLOBAL_HOOKS:${realHooksPath}`);
+  }
+  process.exit(0);
+}
+
+fs.mkdirSync(path.dirname(realHooksPath), { recursive: true });
+if (hadFile) {
+  const backupPath = `${realHooksPath}.bak.${ts}`;
+  fs.copyFileSync(realHooksPath, backupPath);
+  console.log(`BACKUP:${backupPath}`);
+}
+
+// Clean up legacy key if upgrading from agy-hud-pro
+delete existing['agy-hud-pro'];
+
+const merged = {
+  ...existing,
+  'agy-hub-pro': {
+    enabled: true,
+    SessionStart: [
+      { type: 'command', command: `node ${collectorScript} --event SessionStart`, timeout: 5 },
+    ],
+    PreInvocation: [
+      { type: 'command', command: `node ${collectorScript} --event PreInvocation`, timeout: 5 },
+    ],
+    Stop: [
+      { type: 'command', command: `node ${collectorScript} --event Stop`, timeout: 5 },
+    ],
+  },
 };
-fs.writeFileSync(hooksPath, `${JSON.stringify(hooks, null, 2)}\n`, 'utf8');
+
+const tmp = `${realHooksPath}.${process.pid}.${Date.now()}.tmp`;
+fs.writeFileSync(tmp, `${JSON.stringify(merged, null, 2)}\n`, 'utf8');
+fs.renameSync(tmp, realHooksPath);
+console.log(`WRITTEN:${realHooksPath}`);
 NODE_EOF
-  log_ok "已合并生命周期钩子至: ${GLOBAL_HOOKS_FILE}"
+
+  if [[ "${plugin_installed}" -eq 0 ]]; then
+    log_ok "Deep-merged lifecycle hooks into ${global_hooks_file}"
+  fi
+
+  # Ensure data directory exists
+  local data_dir="${AGY_HUB_DATA_DIR:-${HOME}/.gemini/plugins/agy-hub-pro/data}"
+  mkdir -p "${data_dir}" 2>/dev/null || true
+
+  printf "\n${BOLD}${GREEN}✔ AGY Hub Pro installed successfully!${RESET}\n"
+  printf "  ${DIM}• Preview HUD:     node %s --test${RESET}\n" "${STATUSLINE_SCRIPT}"
+  printf "  ${DIM}• Run diagnostics: node %s --doctor${RESET}\n" "${STATUSLINE_SCRIPT}"
+  printf "  ${DIM}• Enable now in agy: /statusline node %s${RESET}\n\n" "${STATUSLINE_SCRIPT}"
+}
+
+uninstall_config() {
+  check_node
+  local purge=0
+  for arg in "$@"; do
+    [[ "${arg}" == "--purge" ]] && purge=1
+  done
+
+  if [[ -x "${SCRIPT_DIR}/uninstall.sh" && "${AGY_HUB_INTERNAL_UNINSTALL:-0}" != "1" ]]; then
+    if [[ "${purge}" -eq 1 ]]; then
+      exec "${SCRIPT_DIR}/uninstall.sh" --purge
+    else
+      exec "${SCRIPT_DIR}/uninstall.sh"
+    fi
+  fi
+
+  local ts
+  ts="$(date +%Y%m%d%H%M%S)"
+  log_header "Uninstalling AGY Hub Pro (clean config restore)"
+
+  node - "${ts}" <<'NODE_EOF'
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const ts = process.argv[2];
+const home = os.homedir();
+const explicitSettings = process.env.AGY_HUB_SETTINGS_FILE || '';
+const settingsCandidates = explicitSettings
+  ? [explicitSettings]
+  : [
+      path.join(home, '.gemini', 'antigravity-cli', 'settings.json'),
+      path.join(home, '.gemini', 'settings.json'),
+    ];
+
+const seenReal = new Set();
+for (const candidate of settingsCandidates) {
+  if (!fs.existsSync(candidate)) continue;
+  let realPath = candidate;
+  try { realPath = fs.realpathSync(candidate); } catch { /* ignore */ }
+  if (seenReal.has(realPath)) continue;
+  seenReal.add(realPath);
+
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(realPath, 'utf8'));
+  } catch (err) {
+    console.error(`WARN: Skipping invalid JSON in ${realPath}: ${err.message}`);
+    continue;
+  }
+
+  const cmd = String(cfg?.statusLine?.command || '');
+  if (cfg?.statusLine && /(agy-hu[bd]-pro|statusline\.mjs)/i.test(cmd)) {
+    const backup = `${realPath}.bak.${ts}`;
+    fs.copyFileSync(realPath, backup);
+    delete cfg.statusLine;
+    const tmp = `${realPath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, realPath);
+    console.log(`REMOVED_STATUSLINE:${realPath} (backup: ${backup})`);
+  }
+}
+
+const hooksFile = process.env.AGY_HUB_HOOKS_FILE || path.join(home, '.gemini', 'config', 'hooks.json');
+if (fs.existsSync(hooksFile)) {
+  let realHooks = hooksFile;
+  try { realHooks = fs.realpathSync(hooksFile); } catch { /* ignore */ }
+  try {
+    const hooks = JSON.parse(fs.readFileSync(realHooks, 'utf8'));
+    if (hooks && (hooks['agy-hub-pro'] || hooks['agy-hud-pro'])) {
+      const backup = `${realHooks}.bak.${ts}`;
+      fs.copyFileSync(realHooks, backup);
+      delete hooks['agy-hub-pro'];
+      delete hooks['agy-hud-pro'];
+      const tmp = `${realHooks}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(tmp, `${JSON.stringify(hooks, null, 2)}\n`, 'utf8');
+      fs.renameSync(tmp, realHooks);
+      console.log(`REMOVED_HOOKS:${realHooks} (backup: ${backup})`);
+    }
+  } catch (err) {
+    console.error(`WARN: Skipping invalid JSON in ${realHooks}: ${err.message}`);
+  }
+}
+NODE_EOF
+
+  if [[ "${AGY_HUB_SKIP_AGY_CLI:-0}" != "1" ]] && command -v agy >/dev/null 2>&1; then
+    agy plugin uninstall agy-hub-pro >/dev/null 2>&1 && log_ok "Removed native plugin: agy-hub-pro" || true
+    agy plugin uninstall agy-hud-pro >/dev/null 2>&1 && log_ok "Removed legacy plugin: agy-hud-pro" || true
+  fi
+
+  # Remove runtime data/cache directory
+  local data_dir="${AGY_HUB_DATA_DIR:-${HOME}/.gemini/plugins/agy-hub-pro/data}"
+  if [[ -d "${data_dir}" ]]; then
+    rm -rf "${data_dir}"
+    log_ok "Cleaned runtime cache directory: ${data_dir}"
+  fi
+  rm -rf "/tmp/agy-hub-pro-data" "/tmp/agy-hud-last-stdin.json" 2>/dev/null || true
+
+  if [[ "${purge}" -eq 1 && -d "${DEFAULT_INSTALL_DIR}" ]]; then
+    local cwd_real install_real
+    cwd_real="$(cd "$(pwd)" && pwd -P)"
+    install_real="$(cd "${DEFAULT_INSTALL_DIR}" && pwd -P)"
+    if [[ "${cwd_real}" != "${install_real}" ]]; then
+      rm -rf "${DEFAULT_INSTALL_DIR}"
+      log_ok "Purged plugin directory: ${DEFAULT_INSTALL_DIR}"
+    else
+      log_warn "Skipped purging ${DEFAULT_INSTALL_DIR} because it is your current working directory."
+    fi
+  fi
+
+  printf "\n${BOLD}${GREEN}✔ AGY Hub Pro uninstalled cleanly. All other settings remain untouched.${RESET}\n"
 }
 
 run_simulation_tests() {
+  check_node
   ensure_executable
 
   local tmp_dir
-  tmp_dir="$(mktemp -d /tmp/agy-hud-pro-test.XXXXXX)"
+  tmp_dir="$(mktemp -d /tmp/agy-hub-pro-test.XXXXXX)"
   trap "rm -rf '${tmp_dir}'" EXIT
 
-  local test_state="${tmp_dir}/state.json"
-  local test_lock="${tmp_dir}/collector.lock"
-  local test_stdin_dump="/tmp/agy-hud-last-stdin.json"
+  local test_data_dir="${tmp_dir}/data"
+  local test_state="${test_data_dir}/state.json"
+  local test_lock="${test_data_dir}/collector.lock"
+  local test_stdin_dump="${test_data_dir}/last-stdin.json"
   local mock_repo="${tmp_dir}/mock-repo"
 
-  # 准备一个临时 Git 仓库（带脏状态）用于演示 git:main* 与 git:feat/auth✓
-  mkdir -p "${mock_repo}"
+  mkdir -p "${test_data_dir}" "${mock_repo}"
   git -C "${mock_repo}" init -q -b main
   git -C "${mock_repo}" config user.email "hud@local"
   git -C "${mock_repo}" config user.name "HUD"
@@ -160,31 +515,37 @@ run_simulation_tests() {
   git -C "${mock_repo}" add README.md
   git -C "${mock_repo}" commit -q -m "init"
 
-  log_header "2. 校验 Antigravity 插件结构 (agy plugin validate)"
+  log_header "2. Validate Antigravity plugin manifest & structure"
   if command -v agy >/dev/null 2>&1; then
-    agy plugin validate --strict "${SCRIPT_DIR}" && log_ok "agy plugin validate --strict 通过！" || log_warn "agy plugin validate 存在提示"
+    agy plugin validate "${SCRIPT_DIR}" && log_ok "agy plugin validate passed!" || log_warn "agy plugin validate reported notes/warnings"
   else
-    log_warn "未检测到 agy 命令，跳过 agy plugin validate"
+    log_warn "agy CLI not detected, skipping agy plugin validate"
   fi
 
-  log_header "3. 模拟 SessionStart 钩子（清理过期锁 + 后台初始化）"
+  log_header "3. Verify built-in CLI flags (--version / --test)"
+  local ver_out
+  ver_out="$(node "${STATUSLINE_SCRIPT}" --version)"
+  log_ok "statusline.mjs --version => ${ver_out}"
+  node "${STATUSLINE_SCRIPT}" --test >/dev/null
+  log_ok "statusline.mjs --test rendered all preview scenarios (exit 0)"
+
+  log_header "4. Simulate SessionStart hook (stale lock cleanup + background init)"
   touch "${test_lock}"
   local out_ss rc_ss
   out_ss="$(printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","cwd":"%s"}\n' "${mock_repo}" \
-    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event SessionStart)"
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${test_state}" AGY_HUB_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event SessionStart)"
   rc_ss=$?
   printf "  stdout : %s\n" "${out_ss}"
   printf "  exit   : %d\n" "${rc_ss}"
 
-  log_header "4. 模拟 Stop 钩子（累加多轮本地 Token 账本：5h 与自然周统计）"
+  log_header "5. Simulate Stop hook (token ledger accumulation + 7-day auto-pruning)"
   local out_stop rc_stop
   out_stop="$(printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","terminationReason":"NO_TOOL_CALL","usage":{"input_tokens":850000,"output_tokens":350000}}\n' \
-    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event Stop)"
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${test_state}" AGY_HUB_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event Stop)"
   rc_stop=$?
   printf "  stdout : %s\n" "${out_stop}"
   printf "  exit   : %d\n" "${rc_stop}"
 
-  # 写入一条 2 天前的自然周记录（3.6M tok）+ 一条 9 天前的过期记录（应被自动清理）
   node - "${test_state}" <<'NODE_EOF'
 const fs = require('node:fs');
 const stateFile = process.argv[2];
@@ -195,41 +556,35 @@ st.ledger.push({ ts: now - 9 * 24 * 3600 * 1000, tokens: 9_999_999, model: 'gemi
 fs.writeFileSync(stateFile, JSON.stringify(st, null, 2));
 NODE_EOF
 
-  # 再触发一次 Stop 钩子让它自动清理 >7 天过期记录并重算（delta = 0 仅触发重算）
   printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","terminationReason":"NO_TOOL_CALL"}\n' \
-    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" AGY_HUD_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${test_state}" AGY_HUB_LOCK_FILE="${test_lock}" AGY_HUB_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
 
-  log_ok "已自动清理 >7 天过期记录，当前本地账本聚合："
-  node -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); console.log("  ledger entries:", s.ledger.length, "| 5h tokens:", s.usage.tokens5h, "| week tokens:", s.usage.tokensWeek, "| est 5h%:", s.quota.remaining5h, "| est wk%:", s.quota.remainingWeek);' "${test_state}"
+  log_ok "Pruned >7d entries and aggregated local ledger:"
+  node -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if (s.ledger.length !== 2) { console.error("Expected 2 entries after pruning, got", s.ledger.length); process.exit(1); } console.log("  ledger entries:", s.ledger.length, "| 5h tokens:", s.usage.tokens5h, "| week tokens:", s.usage.tokensWeek);' "${test_state}"
 
-  log_header "5. 模拟 StatusLine 实时渲染（5圆点进度条：正常绿 ≤80% / 预警黄 >80% / 危急红 >90%）"
+  log_header "6. Simulate live StatusLine rendering (Green ≤80% / Yellow >80% / Red >90%)"
 
-  # 场景 A：正常绿色（已用 ≤80%）+ 脏工作区 git:main* + 实时 stdin 配额
   printf "dirty\n" >> "${mock_repo}/README.md"
-  local rendered_a rc_a ms
-  local payload_a
+  local rendered_a rc_a ms payload_a t0 t1
   payload_a="$(printf '{"model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":18.5,"current_usage":{"input_tokens":2000,"cache_read_input_tokens":98000}},"quota":{"gemini-5h":{"remaining_fraction":0.78,"reset_in_seconds":11880},"gemini-weekly":{"remaining_fraction":0.91,"reset_in_seconds":468000}},"workspace":{"current_dir":"%s"},"cycle_mode":"auto","sandbox":{"enabled":false},"plan_tier":"Google AI Pro","email":"user@example.com"}\n' "${mock_repo}")"
-  local t0 t1
-  t0="$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time*1000')"
+  t0="$(node -e 'console.log(Date.now())')"
   rendered_a="$(printf '%s\n' "${payload_a}" \
-    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${test_state}" AGY_HUB_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
   rc_a=$?
-  t1="$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time*1000')"
+  t1="$(node -e 'console.log(Date.now())')"
   ms=$((t1 - t0))
-  printf "  ${DIM}[场景 A - 正常绿色 (≤80%%) / 脏仓库 / 实测耗时 %dms / exit=%d]${RESET}\n" "${ms}" "${rc_a}"
+  printf "  ${DIM}[Scenario A - Green ≤80%% / Dirty Git / %dms / exit=%d]${RESET}\n" "${ms}" "${rc_a}"
   printf "%s\n\n" "${rendered_a}" | sed 's/^/  /'
 
-  # 场景 B：黄色预警（消耗 >80%，即 Ctx>80%、5h/Wk余量<20%）+ 干净分支 git:feat/auth✓ + camelCase 嗅探
   git -C "${mock_repo}" checkout -q -b feat/auth
   git -C "${mock_repo}" checkout -q -- README.md
   local rendered_b rc_b
   rendered_b="$(printf '{"modelName":"gemini-4-neon","contextWindow":{"usedTokens":840000,"maxTokens":1000000},"quota":{"5h":{"remaining_percentage":18},"weekly":{"remaining_percentage":15}},"cwd":"%s"}\n' "${mock_repo}" \
-    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${test_state}" AGY_HUB_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
   rc_b=$?
-  printf "  ${DIM}[场景 B - 黄色预警 (>80%%) / 干净分支 / camelCase 嗅探 / exit=%d]${RESET}\n" "${rc_b}"
+  printf "  ${DIM}[Scenario B - Yellow >80%% / Clean Branch / camelCase / exit=%d]${RESET}\n" "${rc_b}"
   printf "%s\n\n" "${rendered_b}" | sed 's/^/  /'
 
-  # 场景 C：红色危急（消耗 >90%，即 Ctx>90%、5h/Wk余量<10%）+ 本地估算回退 (~前缀) + 非 Git 目录
   node - "${test_state}" <<'NODE_EOF'
 const fs = require('node:fs');
 const stateFile = process.argv[2];
@@ -237,42 +592,38 @@ const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
 const now = Date.now();
 st.quota.isEstimated = true;
 st.quota.source = 'estimated';
-// 重置为精确的 >90% 消耗账本：5h 消耗 4.6M/5M (~8% 余量)，本周消耗 37.2M/40M (~7% 余量)
 st.ledger = [
   { ts: now - 10 * 60 * 1000, tokens: 4_600_000, model: 'gemini-4-neon', conversationId: 'conv-heavy-5h', source: 'mock' },
   { ts: now - 24 * 3600 * 1000, tokens: 32_600_000, model: 'gemini-4-neon', conversationId: 'conv-heavy-wk', source: 'mock' },
 ];
 fs.writeFileSync(stateFile, JSON.stringify(st, null, 2));
 NODE_EOF
-  # 触发一次重算以更新估算配额缓存
   printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon"}\n' \
-    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" AGY_HUD_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${test_state}" AGY_HUB_LOCK_FILE="${test_lock}" AGY_HUB_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
 
   local rendered_c rc_c
   rendered_c="$(printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":92.5},"cwd":"/tmp"}\n' \
-    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${test_state}" AGY_HUB_LAST_STDIN="${test_stdin_dump}" node "${STATUSLINE_SCRIPT}")"
   rc_c=$?
-  printf "  ${DIM}[场景 C - 红色危急 (>90%%) / 本地估算(~前缀) / 非 Git 优雅隐藏 / exit=%d]${RESET}\n" "${rc_c}"
+  printf "  ${DIM}[Scenario C - Red >90%% / Local Estimate ~ / Non-Git / exit=%d]${RESET}\n" "${rc_c}"
   printf "%s\n" "${rendered_c}" | sed 's/^/  /'
 
-  log_header "6. 模拟 PreInvocation / UserPromptSubmit 主动预警钩子（余量 < 15% 注入切换模型提醒）"
+  log_header "7. Simulate PreInvocation low-quota warning (<15%)"
   local out_warn rc_warn
-  out_warn="$(printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","lastUserInput":"重构整个后端模块"}\n' \
-    | AGY_HUD_STATE_FILE="${test_state}" AGY_HUD_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event UserPromptSubmit)"
+  out_warn="$(printf '{"conversationId":"conv-demo-001","modelName":"gemini-4-neon","lastUserInput":"refactor backend"}\n' \
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${test_state}" AGY_HUB_LOCK_FILE="${test_lock}" node "${COLLECTOR_SCRIPT}" --event UserPromptSubmit)"
   rc_warn=$?
   printf "  exit   : %d\n" "${rc_warn}"
   printf "  stdout : %s\n" "${out_warn}"
 
-  log_header "7. 验证周配额周期对齐 (reset_time - 7d / reset_in_seconds / 过期回退)"
+  log_header "8. Verify weekly quota cycle alignment (reset_time / reset_in_seconds / fallback)"
   local align_state="${tmp_dir}/state-align.json"
   local align_lock="${tmp_dir}/collector-align.lock"
   local align_reset_iso
   align_reset_iso="$(node -e 'console.log(new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString())')"
 
-  # 写入跨重置周期账本：3 天前（上一周配额周期，应被排除）+ 1 天前（当前周配额周期，应被计入）
   node - "${align_state}" <<'NODE_EOF'
 const fs = require('node:fs');
-const stateFile = process.argv[2];
 const now = Date.now();
 const st = {
   version: 1,
@@ -286,44 +637,29 @@ const st = {
     { ts: now - 1 * 24 * 3600 * 1000, tokens: 500_000, model: 'gemini-4-neon', conversationId: 'conv-curr-cycle', source: 'mock' },
   ],
 };
-fs.writeFileSync(stateFile, JSON.stringify(st, null, 2));
+fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
 NODE_EOF
 
-  # 7a. statusline.mjs 使用 reset_time (now + 5d => 当前周期起算于 now - 2d)，仅计入 500K tok
   local rendered_align
   rendered_align="$(printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":10},"quota":{"gemini-weekly":{"remaining_fraction":0.85,"reset_time":"%s"}},"cwd":"/tmp"}\n' "${align_reset_iso}" \
-    | NO_COLOR=1 AGY_HUD_STATE_FILE="${align_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/align-stdin.json" node "${STATUSLINE_SCRIPT}")"
+    | NO_COLOR=1 AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${align_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/align-stdin.json" node "${STATUSLINE_SCRIPT}")"
   node - "${align_state}" "${align_reset_iso}" "${rendered_align}" <<'NODE_EOF'
 const fs = require('node:fs');
 const [stateFile, expectedReset, rendered] = process.argv.slice(2);
 const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-if (st.usage.tokensWeek !== 500_000) {
-  console.error(`FAIL 7a: expected tokensWeek=500000, got ${st.usage.tokensWeek}`);
-  process.exit(1);
-}
-if (st.quota.resetWeekTime !== expectedReset) {
-  console.error(`FAIL 7a: expected resetWeekTime=${expectedReset}, got ${st.quota.resetWeekTime}`);
-  process.exit(1);
-}
-if (!rendered.includes('500K tok')) {
-  console.error(`FAIL 7a: expected rendered output to include "500K tok", got:\n${rendered}`);
-  process.exit(1);
-}
+if (st.usage.tokensWeek !== 500_000) { console.error(`FAIL 8a: tokensWeek=${st.usage.tokensWeek}`); process.exit(1); }
+if (st.quota.resetWeekTime !== expectedReset) { console.error(`FAIL 8a: resetWeekTime=${st.quota.resetWeekTime}`); process.exit(1); }
+if (!rendered.includes('500K tok')) { console.error(`FAIL 8a: rendered missing 500K tok`); process.exit(1); }
 NODE_EOF
 
-  # 7b. collector.mjs Stop 钩子保持与 statusline 一致的周周期汇总
   printf '{"conversationId":"conv-curr-cycle","modelName":"gemini-4-neon","terminationReason":"NO_TOOL_CALL"}\n' \
-    | AGY_HUD_STATE_FILE="${align_state}" AGY_HUD_LOCK_FILE="${align_lock}" AGY_HUD_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
+    | AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${align_state}" AGY_HUB_LOCK_FILE="${align_lock}" AGY_HUB_LAST_STDIN="${tmp_dir}/none.json" node "${COLLECTOR_SCRIPT}" --event Stop >/dev/null
   node - "${align_state}" <<'NODE_EOF'
 const fs = require('node:fs');
 const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-if (st.usage.tokensWeek !== 500_000) {
-  console.error(`FAIL 7b: collector Stop expected tokensWeek=500000, got ${st.usage.tokensWeek}`);
-  process.exit(1);
-}
+if (st.usage.tokensWeek !== 500_000) { console.error(`FAIL 8b: collector Stop tokensWeek=${st.usage.tokensWeek}`); process.exit(1); }
 NODE_EOF
 
-  # 7c. 仅提供 reset_in_seconds (6 天剩余 => 周期起算于 1 天前)，自动推导 resetWeekTime 并排除 4 天前记录
   local align_sec_state="${tmp_dir}/state-align-sec.json"
   node - "${align_sec_state}" <<'NODE_EOF'
 const fs = require('node:fs');
@@ -343,50 +679,147 @@ const st = {
 fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
 NODE_EOF
   printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":10},"quota":{"gemini-weekly":{"remaining_fraction":0.9,"reset_in_seconds":518400}},"cwd":"/tmp"}\n' \
-    | NO_COLOR=1 AGY_HUD_STATE_FILE="${align_sec_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/align-sec-stdin.json" node "${STATUSLINE_SCRIPT}" >/dev/null
+    | NO_COLOR=1 AGY_HUB_DATA_DIR="${test_data_dir}" AGY_HUB_STATE_FILE="${align_sec_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/align-sec-stdin.json" node "${STATUSLINE_SCRIPT}" >/dev/null
   node - "${align_sec_state}" <<'NODE_EOF'
 const fs = require('node:fs');
 const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-if (st.usage.tokensWeek !== 300_000) {
-  console.error(`FAIL 7c: reset_in_seconds-only expected tokensWeek=300000, got ${st.usage.tokensWeek}`);
-  process.exit(1);
-}
-if (!st.quota.resetWeekTime || !Number.isFinite(Date.parse(st.quota.resetWeekTime))) {
-  console.error(`FAIL 7c: expected derived ISO resetWeekTime, got ${st.quota.resetWeekTime}`);
-  process.exit(1);
-}
+if (st.usage.tokensWeek !== 300_000) { console.error(`FAIL 8c: tokensWeek=${st.usage.tokensWeek}`); process.exit(1); }
+if (!st.quota.resetWeekTime || !Number.isFinite(Date.parse(st.quota.resetWeekTime))) { console.error(`FAIL 8c: missing resetWeekTime`); process.exit(1); }
 NODE_EOF
+  log_ok "Weekly quota cycle alignment verified"
 
-  # 7d. 过期 resetWeekTime 且无实时重置时间时安全回退至本地自然周
-  node - "${align_sec_state}" <<'NODE_EOF'
+  log_header "9. Verify safe Deep Merge, Symlink preservation, --doctor PASS, & Clean Uninstall"
+  local mock_cfg_dir="${tmp_dir}/cfg"
+  local real_settings="${mock_cfg_dir}/real-settings.json"
+  local link_settings="${mock_cfg_dir}/settings.json"
+  local mock_hooks="${mock_cfg_dir}/hooks.json"
+  local mock_data="${tmp_dir}/isolated-data"
+  mkdir -p "${mock_cfg_dir}" "${mock_data}"
+
+  cat > "${real_settings}" <<'EOF'
+{
+  "model": "gemini-4-neon",
+  "altScreenMode": "always",
+  "mcpServers": {
+    "my-custom-mcp": { "command": "npx", "args": ["-y", "example-mcp"] }
+  },
+  "trustedWorkspaces": ["/Users/example/project"],
+  "permissions": { "allow": ["Read", "Grep"] }
+}
+EOF
+  ln -s "${real_settings}" "${link_settings}"
+
+  cat > "${mock_hooks}" <<'EOF'
+{
+  "user-custom-hook": {
+    "enabled": true,
+    "Stop": [{ "type": "command", "command": "echo keep-me" }]
+  },
+  "agy-hud-pro": {
+    "enabled": true
+  }
+}
+EOF
+
+  # Run install against isolated mock symlinked settings + hooks
+  AGY_HUB_SETTINGS_FILE="${link_settings}" \
+  AGY_HUB_HOOKS_FILE="${mock_hooks}" \
+  AGY_HUB_DATA_DIR="${mock_data}" \
+  AGY_HUB_SKIP_AGY_CLI=1 \
+    bash "${SCRIPT_DIR}/install.sh" --install >/dev/null
+
+  node - "${link_settings}" "${real_settings}" "${mock_hooks}" "${STATUSLINE_SCRIPT}" <<'NODE_EOF'
 const fs = require('node:fs');
-const now = Date.now();
-const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-st.quota.resetWeekTime = new Date(now - 3600 * 1000).toISOString();
-st.ledger = [
-  { ts: now - 5 * 60 * 1000, tokens: 120_000, model: 'gemini-4-neon', conversationId: 'conv-fallback', source: 'mock' },
-];
-fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
-NODE_EOF
-  printf '{"model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":10},"cwd":"/tmp"}\n' \
-    | NO_COLOR=1 AGY_HUD_STATE_FILE="${align_sec_state}" AGY_HUD_LAST_STDIN="${tmp_dir}/align-fb-stdin.json" node "${STATUSLINE_SCRIPT}" >/dev/null
-  node - "${align_sec_state}" <<'NODE_EOF'
-const fs = require('node:fs');
-const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-if (st.usage.tokensWeek !== 120_000) {
-  console.error(`FAIL 7d: fallback expected tokensWeek=120000, got ${st.usage.tokensWeek}`);
+const path = require('node:path');
+const [linkSettings, realSettings, hooksPath, statuslineScript] = process.argv.slice(2);
+
+if (!fs.lstatSync(linkSettings).isSymbolicLink()) {
+  console.error('FAIL 9a: Symlink settings.json was destroyed!');
+  process.exit(1);
+}
+const backups = fs.readdirSync(path.dirname(realSettings)).filter((f) => /^real-settings\.json\.bak\.\d{14}$/.test(f));
+if (backups.length < 1) {
+  console.error('FAIL 9b: Timestamped backup was not created!');
+  process.exit(1);
+}
+const cfg = JSON.parse(fs.readFileSync(realSettings, 'utf8'));
+if (cfg.model !== 'gemini-4-neon' || cfg.mcpServers?.['my-custom-mcp']?.command !== 'npx' || cfg.trustedWorkspaces?.[0] !== '/Users/example/project' || cfg.permissions?.allow?.[0] !== 'Read') {
+  console.error('FAIL 9c: Existing user settings were not preserved!', cfg);
+  process.exit(1);
+}
+if (!cfg.statusLine || cfg.statusLine.command !== `node ${statuslineScript}` || cfg.statusLine.enabled !== true) {
+  console.error('FAIL 9d: statusLine was not properly merged!', cfg.statusLine);
+  process.exit(1);
+}
+const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+if (!hooks['user-custom-hook'] || !hooks['agy-hub-pro'] || hooks['agy-hud-pro']) {
+  console.error('FAIL 9e: hooks.json merge / legacy cleanup failed!', hooks);
   process.exit(1);
 }
 NODE_EOF
-  log_ok "周配额周期对齐校验全部通过（reset_time / collector Stop / reset_in_seconds / 过期回退）"
+  log_ok "Deep merge preserved mcpServers/trustedWorkspaces/permissions/model, kept symlink & created timestamped backup"
 
-  log_header "8. 验证字段嗅探文件 (/tmp/agy-hud-last-stdin.json)"
+  # Run --doctor against the mounted isolated config — must exit 0 with 0 failures!
+  AGY_HUB_SETTINGS_FILE="${link_settings}" \
+  AGY_HUB_HOOKS_FILE="${mock_hooks}" \
+  AGY_HUB_DATA_DIR="${mock_data}" \
+    node "${STATUSLINE_SCRIPT}" --doctor --json | node -e '
+      const res = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      if (!res.ok || res.failures !== 0) { console.error("FAIL 9f: --doctor reported failures:", res); process.exit(1); }
+    '
+  log_ok "statusline.mjs --doctor passed with 0 failures against mounted symlinked config"
+
+  # Run uninstall against isolated config
+  AGY_HUB_SETTINGS_FILE="${link_settings}" \
+  AGY_HUB_HOOKS_FILE="${mock_hooks}" \
+  AGY_HUB_DATA_DIR="${mock_data}" \
+  AGY_HUB_SKIP_AGY_CLI=1 \
+    bash "${SCRIPT_DIR}/uninstall.sh" >/dev/null
+
+  node - "${real_settings}" "${mock_hooks}" <<'NODE_EOF'
+const fs = require('node:fs');
+const [realSettings, hooksPath] = process.argv.slice(2);
+const cfg = JSON.parse(fs.readFileSync(realSettings, 'utf8'));
+if (cfg.statusLine !== undefined) {
+  console.error('FAIL 9g: statusLine was not removed on uninstall!');
+  process.exit(1);
+}
+if (cfg.model !== 'gemini-4-neon' || cfg.mcpServers?.['my-custom-mcp']?.command !== 'npx' || cfg.permissions?.allow?.[0] !== 'Read') {
+  console.error('FAIL 9h: User settings damaged during uninstall!');
+  process.exit(1);
+}
+const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+if (!hooks['user-custom-hook'] || hooks['agy-hub-pro'] || hooks['agy-hud-pro']) {
+  console.error('FAIL 9i: hooks.json uninstall failed!', hooks);
+  process.exit(1);
+}
+NODE_EOF
+  log_ok "Clean uninstall removed only agy-hub-pro entries and preserved all user configs"
+
+  log_header "10. Verify stdin field sniffing snapshot"
   if [[ -f "${test_stdin_dump}" ]]; then
-    log_ok "已生成 ${test_stdin_dump}（前 8 行）："
-    head -n 8 "${test_stdin_dump}" | sed 's/^/  /'
+    log_ok "Generated ${test_stdin_dump} (first 6 lines):"
+    head -n 6 "${test_stdin_dump}" | sed 's/^/  /'
   fi
 
-  printf "\n${BOLD}${GREEN}✔ 全部模拟测试通过！${RESET}\n"
+  printf "\n${BOLD}${GREEN}✔ All simulation, deep-merge, doctor, and uninstall tests passed!${RESET}\n"
+}
+
+print_usage() {
+  cat <<EOF
+AGY Hub Pro — Installer & Test Runner
+
+Usage:
+  ./install.sh --install               Backup & deep-merge settings.json + register hooks
+  ./install.sh --uninstall [--purge]   Cleanly remove statusLine & hooks (preserves all other settings)
+  ./install.sh --doctor                Run environment, config mount, and cache permission diagnostics
+  ./install.sh --test                  Run full simulation, deep-merge, and uninstall test suite
+  ./install.sh --preview               Preview JSON merge snippets without modifying files
+  ./install.sh --help                  Show this help message
+
+Remote one-liner:
+  curl -fsSL https://raw.githubusercontent.com/bangbangda/agy-hub-pro/main/install.sh | bash
+EOF
 }
 
 case "${1:-}" in
@@ -399,12 +832,29 @@ case "${1:-}" in
   --install)
     install_config
     ;;
+  --uninstall)
+    shift || true
+    uninstall_config "$@"
+    ;;
+  --doctor)
+    check_node
+    shift || true
+    node "${STATUSLINE_SCRIPT}" --doctor "$@"
+    ;;
+  --help|-h)
+    print_usage
+    ;;
   "")
-    run_simulation_tests
-    preview_config
+    if [[ "${REMOTE_MODE}" -eq 1 ]]; then
+      install_config
+    else
+      run_simulation_tests
+      preview_config
+    fi
     ;;
   *)
-    echo "用法: $0 [--test | --preview | --install]"
+    log_err "Unknown option: $1"
+    print_usage
     exit 1
     ;;
 esac

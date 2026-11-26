@@ -1,8 +1,11 @@
-# Runtime state & lock files
+# Runtime state, data & lock files
+data/
 state.json
 collector.lock
+last-stdin.json
 *.tmp
 *.bak
+*.bak.*
 
 # macOS / Editor
 .DS_Store

@@ -13,8 +13,8 @@
  *   node statusline.mjs --help         # Show CLI help
  *
  * Renders compact 2-line ANSI dashboard:
- *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ Cache: 98% │ 5h: ◉◉◉◉○ 83% (238K tok · 3h18m) │ Wk: ◉◉◉◉○ 74% (238K tok · 5d9h)
- *   Line 2: [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF
+ *   Line 1: agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 14.8% (155K/1M) │ Tok: 1.4M │ Cache: 98% │ 5h: ◉◉◉◉○ 83% (3h18m) │ Wk: ◉◉◉◉○ 74% (5d9h)
+ *   Line 2: [Gemini 4 Neon · High] │ User: user@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ ● run_command 18s · ~56 t/s
  */
 
 import fs from 'node:fs';
@@ -59,8 +59,13 @@ const LAST_STDIN_FILE =
 const GIT_TIMEOUT_MS = Number(
   process.env.AGY_HUB_GIT_TIMEOUT_MS || process.env.AGY_HUD_GIT_TIMEOUT_MS || 150
 );
+const STALL_WARN_MS =
+  Math.max(5, Number(process.env.AGY_HUB_STALL_SEC || process.env.AGY_HUD_STALL_SEC || 60)) * 1000;
 const SHOW_NON_GIT =
   (process.env.AGY_HUB_SHOW_NON_GIT || process.env.AGY_HUD_SHOW_NON_GIT) === '1';
+const TRANSCRIPT_TAIL_BYTES = 16384;
+const MAX_TRACKED_WINDOWS = 16;
+const MAX_SESSION_TOKEN_CACHE = 32;
 
 const USE_COLOR = !process.env.NO_COLOR;
 const ANSI = {
@@ -133,7 +138,6 @@ function formatCompactTokens(n) {
 
 function formatWindowSize(n) {
   const v = Math.max(0, Number(n) || 0);
-  // Treat 1,048,576 (1 MiB) and 1,000,000 as clean "1M"
   if (v >= 990_000 && v <= 1_060_000) return '1M';
   if (v >= 1_980_000 && v <= 2_120_000) return '2M';
   return formatCompactTokens(v);
@@ -163,7 +167,6 @@ function normalizeModelName(raw) {
     raw
       .trim()
       .replace(/^models\//i, '')
-      // Strip trailing effort suffix like "(High)" so it isn't duplicated next to the effort tag
       .replace(/\s*\((?:none|minimal|low|medium|high|xhigh|max)\)\s*$/i, '')
       .trim() || raw.trim()
   );
@@ -199,7 +202,6 @@ async function readAndSniffStdin() {
       parsed = { _raw: raw };
     }
 
-    // Field sniffing dump: save latest snapshot into data directory
     try {
       const debugFlag = process.env.AGY_HUB_DEBUG || process.env.AGY_HUD_DEBUG;
       const sniffFlag = process.env.AGY_HUB_SNIFF ?? process.env.AGY_HUD_SNIFF;
@@ -258,7 +260,6 @@ function extractModelInfo(payload) {
     }
   }
 
-  // Fallback: extract effort from parenthetical suffix in model display_name e.g. "Gemini 4 Neon (High)"
   if (!rawEffort && rawName) {
     const m = rawName.match(/\((none|minimal|low|medium|high|xhigh|max)\)\s*$/i);
     if (m) rawEffort = m[1];
@@ -278,7 +279,6 @@ function extractContextWindow(payload) {
     payload.usage ||
     {};
 
-  // 1. Resolve window max size
   const rawMax =
     cw.context_window_size ??
     cw.contextWindowSize ??
@@ -292,7 +292,6 @@ function extractContextWindow(payload) {
     1_000_000;
   const maxTokens = Number(rawMax) > 0 ? Number(rawMax) : 1_000_000;
 
-  // 2. Resolve used tokens (supports nested current_usage / camelCase / snake_case)
   let usedTokens = null;
   const directUsed =
     cw.used_tokens ??
@@ -317,7 +316,6 @@ function extractContextWindow(payload) {
     if (sum > 0) usedTokens = sum;
   }
 
-  // 3. Resolve used percentage
   let usedPct = null;
   const directPct =
     cw.used_percentage ??
@@ -343,7 +341,6 @@ function extractContextWindow(payload) {
     usedPct = (usedTokens / maxTokens) * 100;
   }
 
-  // Back-calculate usedTokens when only used_percentage + context_window_size are provided
   if (usedTokens == null && usedPct != null) {
     usedTokens = Math.round((maxTokens * usedPct) / 100);
   }
@@ -424,7 +421,6 @@ function extractLiveQuotaFromStdin(payload) {
   let info5h = pickByKeys(preferred5h);
   let infoWk = pickByKeys(preferredWk);
 
-  // Fuzzy fallback: skip 3p-* and *-wtu-* buckets unless active model is 3p
   for (const [k, v] of Object.entries(q)) {
     const lk = k.toLowerCase();
     if (!is3p && (lk.startsWith('3p-') || lk.startsWith('3p_') || lk.includes('wtu'))) continue;
@@ -487,6 +483,210 @@ function extractSessionTotalTokens(payload) {
   const outTok = Number(cw.total_output_tokens ?? cw.totalOutputTokens ?? 0);
   const sum = (Number.isFinite(inTok) ? inTok : 0) + (Number.isFinite(outTok) ? outTok : 0);
   return sum > 0 ? Math.round(sum) : 0;
+}
+
+function extractSessionOutputTokens(payload) {
+  const cw = payload.context_window || payload.contextWindow || {};
+  const outTok = Number(
+    cw.total_output_tokens ?? cw.totalOutputTokens ?? payload.total_output_tokens ?? 0
+  );
+  return Number.isFinite(outTok) && outTok > 0 ? Math.round(outTok) : 0;
+}
+
+function extractAgentWorking(payload) {
+  const raw =
+    payload.agent_state ??
+    payload.agentState ??
+    payload.state ??
+    payload.status ??
+    '';
+  if (typeof raw !== 'string') return false;
+  const s = raw.trim().toLowerCase();
+  return (
+    s === 'working' ||
+    s === 'running' ||
+    s === 'thinking' ||
+    s === 'streaming' ||
+    s === 'executing' ||
+    s === 'in_progress' ||
+    s === 'busy'
+  );
+}
+
+function extractNativeTokensPerSec(payload) {
+  const candidates = [
+    payload.tokens_per_second,
+    payload.tokensPerSecond,
+    payload.output_tokens_per_second,
+    payload.outputTokensPerSecond,
+    payload.context_window?.tokens_per_second,
+    payload.contextWindow?.tokensPerSecond,
+    payload.usage?.tokens_per_second,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (c != null && Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+function resolveTranscriptPath(payload) {
+  const raw = payload.transcript_path || payload.transcriptPath || '';
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const trimmed = raw.trim();
+  if (fs.existsSync(trimmed)) return trimmed;
+  if (trimmed.includes('/.gemini/antigravity/brain/')) {
+    const alt = trimmed.replace('/.gemini/antigravity/brain/', '/.gemini/antigravity-cli/brain/');
+    if (fs.existsSync(alt)) return alt;
+  }
+  return null;
+}
+
+function normalizeToolLabel(rawName) {
+  if (!rawName || typeof rawName !== 'string') return '';
+  let name = rawName.trim().replace(/^(?:default_api:|functions\.)/i, '');
+  if (name.length > 20) name = `${name.slice(0, 19)}…`;
+  return name;
+}
+
+function readLatestTranscriptAction(payload) {
+  if (payload._mockTranscriptAction) return payload._mockTranscriptAction;
+  const filePath = resolveTranscriptPath(payload);
+  if (!filePath) return { label: '思考中', stepKey: null };
+
+  let fd = null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size === 0) return { label: '思考中', stepKey: null };
+
+    const readLen = Math.min(stat.size, TRANSCRIPT_TAIL_BYTES);
+    const startPos = stat.size - readLen;
+    const buf = Buffer.allocUnsafe(readLen);
+    fd = fs.openSync(filePath, 'r');
+    const bytesRead = fs.readSync(fd, buf, 0, readLen, startPos);
+    const text = buf.subarray(0, bytesRead).toString('utf8');
+
+    const lines = text.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        return { label: '思考中', stepKey: `size:${stat.size}` };
+      }
+
+      const stepIdx = entry.step_index ?? entry.stepIndex ?? '';
+      const type = String(entry.type || '').toUpperCase();
+      const toolCalls = Array.isArray(entry.tool_calls)
+        ? entry.tool_calls
+        : Array.isArray(entry.toolCalls)
+          ? entry.toolCalls
+          : [];
+
+      if (type === 'PLANNER_RESPONSE' && toolCalls.length > 0) {
+        const names = toolCalls
+          .map((tc) => normalizeToolLabel(tc?.name || tc?.function?.name || tc?.tool_name || ''))
+          .filter(Boolean);
+        if (names.length > 0) {
+          const lastName = names[names.length - 1];
+          const allSame = names.length > 1 && names.every((n) => n === lastName);
+          const label = allSame ? `${lastName}×${names.length}` : lastName;
+          return { label, stepKey: `${stepIdx}:${label}` };
+        }
+      }
+
+      return { label: '思考中', stepKey: `${stepIdx}:${type || 'thinking'}` };
+    }
+  } catch {
+    // Never fail statusline on transcript I/O error
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  return { label: '思考中', stepKey: null };
+}
+
+function formatElapsedCompact(ms) {
+  const sec = Math.floor(Math.max(0, ms) / 1000);
+  if (sec < 1) return '';
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const remSec = sec % 60;
+  if (min < 60) return remSec > 0 ? `${min}m${remSec}s` : `${min}m`;
+  const hr = Math.floor(min / 60);
+  const remMin = min % 60;
+  return remMin > 0 ? `${hr}h${remMin}m` : `${hr}h`;
+}
+
+function formatTokensPerSec(tps, isEstimated) {
+  if (typeof tps !== 'number' || !Number.isFinite(tps) || tps <= 0) return '';
+  const val = tps >= 10 ? `${Math.round(tps)}` : tps.toFixed(1).replace(/\.0$/, '');
+  return `${isEstimated ? '~' : ''}${val} t/s`;
+}
+
+function resolveWindowId() {
+  const candidates = [
+    process.env.AGY_HUB_WINDOW_ID,
+    process.env.AGY_HUD_WINDOW_ID,
+    process.env.TMUX_PANE,
+    process.env.ITERM_SESSION_ID,
+    process.env.TERM_SESSION_ID,
+    process.env.WEZTERM_PANE,
+    process.env.KITTY_WINDOW_ID,
+    process.env.WT_SESSION,
+    process.env.ALACRITTY_WINDOW_ID,
+    process.env.VSCODE_PID,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  return '_default';
+}
+
+function formatActivitySegment(activity, isWorking, nativeTps, transcriptAction, now) {
+  const isEstimated = nativeTps === null;
+  const activeTps =
+    nativeTps !== null
+      ? nativeTps
+      : typeof activity?.lastTps === 'number' &&
+          Number.isFinite(activity.lastTps) &&
+          activity.lastTps > 0
+        ? activity.lastTps
+        : null;
+  const tpsLabel = activeTps !== null ? formatTokensPerSec(activeTps, isEstimated) : '';
+
+  if (isWorking) {
+    const startAt = activity?.workStartAt || now;
+    const progressAt = activity?.lastProgressAt || startAt;
+    const elapsedStr = formatElapsedCompact(now - startAt);
+    const isStalled = now - progressAt >= STALL_WARN_MS;
+
+    const dotColor = isStalled ? ANSI.yellow : ANSI.green;
+    const actionLabel = transcriptAction?.label || '思考中';
+    const actionColor = actionLabel === '思考中' ? ANSI.dim : ANSI.cyan;
+    const elapsedColor = isStalled ? ANSI.yellow : ANSI.dim;
+
+    let text = `${dotColor}●${ANSI.reset} ${actionColor}${actionLabel}${ANSI.reset}`;
+    if (elapsedStr) text += ` ${elapsedColor}${elapsedStr}${ANSI.reset}`;
+    if (tpsLabel) {
+      text += ` ${ANSI.dim}·${ANSI.reset} ${ANSI.cyan}${tpsLabel}${ANSI.reset}`;
+    }
+    return { priority: 5, text };
+  }
+
+  if (tpsLabel) {
+    return { priority: 3, text: `${ANSI.dim}${tpsLabel}${ANSI.reset}` };
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -618,7 +818,257 @@ function resolveWindowWeekStartMs(liveQuota, state, now = Date.now()) {
   });
 }
 
-function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName, persist = true) {
+function syncActivityState(state, payload, now, windowId, isWorking, outTok, nativeTps, transcriptAction) {
+  const sessionId = payload.conversation_id || payload.session_id || payload.conversationId || '_default';
+  if (!state.windowActivity || typeof state.windowActivity !== 'object') {
+    state.windowActivity = {};
+  }
+
+  let prev =
+    state.windowActivity[windowId] && typeof state.windowActivity[windowId] === 'object'
+      ? state.windowActivity[windowId]
+      : null;
+
+  if (!prev && state.activity && typeof state.activity === 'object') {
+    const legacyWin = state.activity.windowId || '_default';
+    if (legacyWin === windowId) {
+      prev = state.activity;
+    }
+  }
+
+  const sameWindow = Boolean(prev);
+  const sameSession = Boolean(prev && prev.sessionId === sessionId);
+
+  let dirty = false;
+  const preservedTps =
+    sameWindow && typeof prev.lastTps === 'number' && Number.isFinite(prev.lastTps) && prev.lastTps > 0
+      ? prev.lastTps
+      : null;
+  const preservedTpsAt = preservedTps !== null ? (prev.lastTpsAt || 0) : 0;
+
+  const act = sameSession
+    ? { ...prev, windowId }
+    : {
+        windowId,
+        sessionId,
+        isWorking: false,
+        workStartAt: null,
+        lastProgressAt: null,
+        lastOutTokens: outTok,
+        lastOutAt: now,
+        lastTps: preservedTps,
+        lastTpsAt: preservedTpsAt,
+        lastStepKey: null,
+        updatedAt: now,
+      };
+
+  if (!sameSession && (isWorking || outTok > 0 || preservedTps !== null)) {
+    dirty = true;
+  }
+
+  const wasWorking = Boolean(act.isWorking);
+
+  if (act.lastOutTokens > 0 && outTok < act.lastOutTokens) {
+    act.lastOutTokens = outTok;
+    act.lastOutAt = now;
+    dirty = true;
+  } else if (outTok > (act.lastOutTokens || 0)) {
+    const deltaOut = outTok - (act.lastOutTokens || 0);
+    const refTime = act.lastOutAt || act.workStartAt || 0;
+    const dtMs = refTime > 0 ? now - refTime : 0;
+
+    if (sameSession && dtMs >= 200 && dtMs <= 120_000) {
+      const rawTps = deltaOut / (dtMs / 1000);
+      if (rawTps >= 0.5 && rawTps <= 5000) {
+        const smoothed =
+          typeof act.lastTps === 'number' &&
+          Number.isFinite(act.lastTps) &&
+          act.lastTpsAt > 0 &&
+          now - act.lastTpsAt < 30_000
+            ? act.lastTps * 0.35 + rawTps * 0.65
+            : rawTps;
+        act.lastTps = Math.round(smoothed * 10) / 10;
+        act.lastTpsAt = now;
+      }
+    }
+    act.lastOutTokens = outTok;
+    act.lastOutAt = now;
+    act.lastProgressAt = now;
+    dirty = true;
+  } else if (outTok > 0 && !act.lastOutTokens) {
+    act.lastOutTokens = outTok;
+    act.lastOutAt = now;
+    dirty = true;
+  }
+
+  if (nativeTps !== null) {
+    const roundedNative = Math.round(nativeTps * 10) / 10;
+    if (act.lastTps !== roundedNative || now - (act.lastTpsAt || 0) > 5_000) {
+      act.lastTps = roundedNative;
+      act.lastTpsAt = now;
+      dirty = true;
+    }
+  }
+
+  if (isWorking && !wasWorking) {
+    act.isWorking = true;
+    act.workStartAt = now;
+    act.lastProgressAt = now;
+    if (act.lastOutAt !== now) {
+      act.lastOutAt = now;
+      act.lastOutTokens = outTok;
+    }
+    act.lastStepKey = transcriptAction?.stepKey || null;
+    dirty = true;
+  } else if (isWorking && wasWorking) {
+    if (!act.workStartAt) {
+      act.workStartAt = now;
+      dirty = true;
+    }
+    if (!act.lastProgressAt) {
+      act.lastProgressAt = act.workStartAt;
+      dirty = true;
+    }
+    if (transcriptAction?.stepKey && transcriptAction.stepKey !== act.lastStepKey) {
+      act.lastStepKey = transcriptAction.stepKey;
+      act.lastProgressAt = now;
+      dirty = true;
+    }
+  } else if (!isWorking && wasWorking) {
+    act.isWorking = false;
+    act.workStartAt = null;
+    act.lastStepKey = null;
+    dirty = true;
+  }
+
+  if (dirty) {
+    act.updatedAt = now;
+  }
+  state.windowActivity[windowId] = act;
+
+  const winKeys = Object.keys(state.windowActivity);
+  if (winKeys.length > MAX_TRACKED_WINDOWS) {
+    winKeys
+      .sort((a, b) => (state.windowActivity[b]?.updatedAt || 0) - (state.windowActivity[a]?.updatedAt || 0))
+      .slice(MAX_TRACKED_WINDOWS)
+      .forEach((k) => {
+        delete state.windowActivity[k];
+      });
+    dirty = true;
+  }
+
+  state.activity = act;
+  return { activity: act, dirty };
+}
+
+function syncSessionNetTokens(state, payload, now) {
+  if (typeof payload._mockSessionNetTokens === 'number') {
+    return { netTokens: payload._mockSessionNetTokens, dirty: false };
+  }
+  const filePath = resolveTranscriptPath(payload);
+  if (!filePath) return { netTokens: null, dirty: false };
+
+  const sessionId =
+    payload.conversation_id || payload.session_id || payload.conversationId || filePath;
+  if (!state.sessionTokens || typeof state.sessionTokens !== 'object') {
+    state.sessionTokens = {};
+  }
+
+  let fd = null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return { netTokens: null, dirty: false };
+
+    const prev =
+      state.sessionTokens[sessionId] && typeof state.sessionTokens[sessionId] === 'object'
+        ? state.sessionTokens[sessionId]
+        : null;
+
+    const validPrev =
+      prev &&
+      prev.filePath === filePath &&
+      typeof prev.offset === 'number' &&
+      prev.offset >= 0 &&
+      prev.offset <= stat.size;
+
+    const entry = validPrev
+      ? { ...prev }
+      : {
+          filePath,
+          offset: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          updatedAt: now,
+        };
+
+    let dirty = !validPrev && stat.size > 0;
+
+    if (stat.size > entry.offset) {
+      const deltaLen = stat.size - entry.offset;
+      const buf = Buffer.allocUnsafe(deltaLen);
+      fd = fs.openSync(filePath, 'r');
+      const bytesRead = fs.readSync(fd, buf, 0, deltaLen, entry.offset);
+      const chunk = buf.subarray(0, bytesRead);
+      const lastNl = chunk.lastIndexOf(0x0a);
+
+      if (lastNl >= 0) {
+        const completeText = chunk.subarray(0, lastNl).toString('utf8');
+        for (const rawLine of completeText.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          let rec;
+          try {
+            rec = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const inTok = Number(rec.input_tokens ?? rec.inputTokens ?? rec.usage?.input_tokens ?? 0);
+          const outTok = Number(rec.output_tokens ?? rec.outputTokens ?? rec.usage?.output_tokens ?? 0);
+          if (Number.isFinite(inTok) && inTok > 0) entry.inputTokens += inTok;
+          if (Number.isFinite(outTok) && outTok > 0) entry.outputTokens += outTok;
+        }
+        entry.offset += lastNl + 1;
+        entry.updatedAt = now;
+        dirty = true;
+      }
+    }
+
+    if (dirty) {
+      state.sessionTokens[sessionId] = entry;
+      const keys = Object.keys(state.sessionTokens);
+      if (keys.length > MAX_SESSION_TOKEN_CACHE) {
+        keys
+          .sort((a, b) => (state.sessionTokens[b]?.updatedAt || 0) - (state.sessionTokens[a]?.updatedAt || 0))
+          .slice(MAX_SESSION_TOKEN_CACHE)
+          .forEach((k) => {
+            delete state.sessionTokens[k];
+          });
+      }
+    }
+
+    const total = Math.round((entry.inputTokens || 0) + (entry.outputTokens || 0));
+    return { netTokens: total > 0 ? total : null, dirty };
+  } catch {
+    return { netTokens: null, dirty: false };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+function formatSessionTokensSegment(netTokens) {
+  if (typeof netTokens !== 'number' || !Number.isFinite(netTokens) || netTokens <= 0) {
+    return null;
+  }
+  return `${ANSI.dim}Tok:${ANSI.reset} ${ANSI.cyan}${formatCompactTokens(netTokens)}${ANSI.reset}`;
+}
+
+function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, modelName, activityInput, persist = true) {
   const now = Date.now();
   const state =
     existing && typeof existing === 'object'
@@ -654,6 +1104,25 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
   if (!Array.isArray(state.ledger)) state.ledger = [];
 
   let dirty = !existing && Boolean(payload.session_id || payload.conversation_id);
+
+  // 0. Live working state, elapsed timer & output tokens/sec tracker
+  if (activityInput) {
+    const actRes = syncActivityState(
+      state,
+      payload,
+      now,
+      activityInput.windowId,
+      activityInput.isWorking,
+      activityInput.outTok,
+      activityInput.nativeTps,
+      activityInput.transcriptAction
+    );
+    if (actRes.dirty) dirty = true;
+  }
+
+  // 0b. Accurate incremental net token count for the current session (from transcript.jsonl)
+  const sessionNetRes = syncSessionNetTokens(state, payload, now);
+  if (sessionNetRes.dirty) dirty = true;
 
   // 1. Live cross-session token ledger sync (no hook dependency required)
   const sessionId = payload.conversation_id || payload.session_id || payload.conversationId || '';
@@ -716,7 +1185,7 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
     if (syncCachedResetTime(state.quota, 'resetWeekTime', liveQuota.resetWkTime, liveQuota.resetWkSec, SEVEN_DAYS_MS, now)) {
       dirty = true;
     }
-    if (liveQuota.resetWkSec !== null) state.quota.resetWeekSec = liveQuota.resetWkSec;
+    if (liveQuota.resetWkSec !== null) state.quota.resetWkSec = liveQuota.resetWkSec;
   }
 
   // Always recompute 5h & weekly sums aligned to their active cloud quota cycles
@@ -751,7 +1220,7 @@ function syncLiveState(payload, existing, liveQuota, sessionTok, ctxUsedTokens, 
     atomicWriteState(state);
   }
 
-  return state;
+  return { state, sessionNetTokens: sessionNetRes.netTokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +1272,7 @@ function readBranchFromGitHead(startDir) {
 }
 
 function getGitInfo(payload) {
-  if (payload._mockGit) return payload._mockGit;
+  if (payload._mockGit !== undefined) return payload._mockGit;
   const cwd = resolveWorkspaceDir(payload);
 
   try {
@@ -869,7 +1338,6 @@ function getGitInfo(payload) {
       timedOut: false,
     };
   } catch {
-    // Fallback 1: stdin vcs metadata if provided by agy
     const vcsBranch = payload.vcs?.branch;
     if (typeof vcsBranch === 'string' && vcsBranch.trim()) {
       return {
@@ -883,7 +1351,6 @@ function getGitInfo(payload) {
         timedOut: false,
       };
     }
-    // Fallback 2: ultra-fast .git/HEAD read if git status timed out on a huge repo
     const headBranch = readBranchFromGitHead(cwd);
     if (headBranch) {
       return {
@@ -905,7 +1372,6 @@ function formatGitSegment(git) {
   const branchColor = git.dirty ? ANSI.yellow : ANSI.green;
   let seg = `${ANSI.dim}git:${ANSI.reset}${branchColor}${git.branch}${ANSI.reset}`;
 
-  // Remote sync arrows if ahead/behind
   const syncParts = [];
   if (git.ahead > 0) syncParts.push(`${ANSI.cyan}↑${git.ahead}${ANSI.reset}`);
   if (git.behind > 0) syncParts.push(`${ANSI.magenta}↓${git.behind}${ANSI.reset}`);
@@ -1079,7 +1545,7 @@ function colorByPlan(plan) {
   return ANSI.green;
 }
 
-function buildLine2(payload, modelBadge, sep, maxWidth) {
+function buildLine2(payload, modelBadge, activityItem, sep, maxWidth) {
   const account = extractAccountInfo(payload);
 
   const items = [];
@@ -1104,6 +1570,8 @@ function buildLine2(payload, modelBadge, sep, maxWidth) {
 
   const sandboxSeg = formatSandboxSegment(payload);
   if (sandboxSeg) items.push({ priority: 2, text: sandboxSeg });
+
+  if (activityItem) items.push(activityItem);
 
   if (items.length === 0) return null;
 
@@ -1146,13 +1614,25 @@ function renderDashboard(payload, existingState, { persist = true } = {}) {
 
   const liveQuota = extractLiveQuotaFromStdin(payload);
   const sessionTok = extractSessionTotalTokens(payload);
-  const state = syncLiveState(
+  const windowId = resolveWindowId();
+  const isWorking = extractAgentWorking(payload);
+  const outTok = extractSessionOutputTokens(payload);
+  const nativeTps = extractNativeTokensPerSec(payload);
+  const transcriptAction = isWorking ? readLatestTranscriptAction(payload) : null;
+  const { state, sessionNetTokens } = syncLiveState(
     payload,
     existingState,
     liveQuota,
     sessionTok,
     ctx.usedTokens,
     modelInfo.name,
+    {
+      windowId,
+      isWorking,
+      outTok,
+      nativeTps,
+      transcriptAction,
+    },
     persist
   );
   const stateEstimated = state ? Boolean(state.quota?.isEstimated) : true;
@@ -1161,10 +1641,6 @@ function renderDashboard(payload, existingState, { persist = true } = {}) {
   const remWk = liveQuota.remWk ?? state?.quota?.remainingWeek ?? 100;
   const prefix5h = liveQuota.rem5h != null ? '' : stateEstimated ? '~' : '';
   const prefixWk = liveQuota.remWk != null ? '' : stateEstimated ? '~' : '';
-
-  const hasLedger = Array.isArray(state?.ledger) && state.ledger.length > 0;
-  const tok5h = hasLedger ? (state?.usage?.tokens5h ?? 0) : sessionTok;
-  const tokWk = hasLedger ? (state?.usage?.tokensWeek ?? 0) : sessionTok;
 
   const color5h = colorByUsage(100 - rem5h);
   const colorWk = colorByUsage(100 - remWk);
@@ -1190,18 +1666,12 @@ function renderDashboard(payload, existingState, { persist = true } = {}) {
   const resetWkSec = liveQuota.resetWkSec ?? (resetWkTime ? null : state?.quota?.resetWeekSec ?? null);
   const resetWkLabel = formatResetCountdown(resetWkTime, resetWkSec);
 
-  const meta5hFull = reset5hLabel
-    ? `${formatCompactTokens(tok5h)} tok · ${reset5hLabel}${paceTag}`
-    : `${formatCompactTokens(tok5h)} tok${paceTag}`;
-  const metaWkFull = resetWkLabel
-    ? `${formatCompactTokens(tokWk)} tok · ${resetWkLabel}`
-    : `${formatCompactTokens(tokWk)} tok`;
-
+  const tokSeg = formatSessionTokensSegment(sessionNetTokens);
   const cacheSeg = formatCacheSegment(payload);
 
-  const makeLine1 = (compact, includeCache = true) => {
-    const m5h = compact ? (reset5hLabel ? `${reset5hLabel}${paceTag}` : '') : meta5hFull;
-    const mWk = compact ? (resetWkLabel || '') : metaWkFull;
+  const makeLine1 = ({ includeReset = true, includeCache = true, includeTok = true } = {}) => {
+    const m5h = includeReset ? (reset5hLabel ? `${reset5hLabel}${paceTag}` : paceTag.trim()) : '';
+    const mWk = includeReset ? (resetWkLabel || '') : '';
     const s5h =
       `${ANSI.dim}5h:${ANSI.reset} ${dots5h} ${color5h}${prefix5h}${formatPct(rem5h, 0)}${ANSI.reset}` +
       (m5h ? ` ${ANSI.dim}(${m5h})${ANSI.reset}` : '');
@@ -1211,21 +1681,27 @@ function renderDashboard(payload, existingState, { persist = true } = {}) {
     const segs = [];
     if (wsGitSeg) segs.push(wsGitSeg);
     segs.push(segCtx);
+    if (includeTok && tokSeg) segs.push(tokSeg);
     if (includeCache && cacheSeg) segs.push(cacheSeg);
     segs.push(s5h, sWk);
     return segs.join(sep);
   };
 
-  let line1 = makeLine1(false, true);
-  if (visibleWidth(line1) > maxWidth) {
-    line1 = makeLine1(true, true);
-  }
+  let line1 = makeLine1({ includeReset: true, includeCache: true, includeTok: true });
   if (visibleWidth(line1) > maxWidth && cacheSeg) {
-    line1 = makeLine1(true, false);
+    line1 = makeLine1({ includeReset: true, includeCache: false, includeTok: true });
+  }
+  if (visibleWidth(line1) > maxWidth && tokSeg) {
+    line1 = makeLine1({ includeReset: true, includeCache: false, includeTok: false });
+  }
+  if (visibleWidth(line1) > maxWidth) {
+    line1 = makeLine1({ includeReset: false, includeCache: false, includeTok: false });
   }
 
   const lines = [line1];
-  const line2 = buildLine2(payload, modelBadge, sep, maxWidth);
+  const windowActivity = state?.windowActivity?.[windowId] ?? state?.activity;
+  const activityItem = formatActivitySegment(windowActivity, isWorking, nativeTps, transcriptAction, nowMs);
+  const line2 = buildLine2(payload, modelBadge, activityItem, sep, maxWidth);
   if (line2) lines.push(line2);
 
   return `${lines.join('\n')}\n`;
@@ -1242,6 +1718,7 @@ function readPluginVersion() {
 
 function runTestPreview() {
   const now = Date.now();
+  const winId = resolveWindowId();
   const version = readPluginVersion();
   const hr = `${ANSI.dim}${'─'.repeat(72)}${ANSI.reset}`;
 
@@ -1252,24 +1729,26 @@ function runTestPreview() {
 
   const scenarios = [
     {
-      title: '1. Healthy (≤80% consumed · Green · Clean Git · High Cache)',
+      title: '1. Healthy (≤80% · Green · Clean Git · Session Tok · Live Working)',
       payload: {
-        terminal_width: 160,
+        session_id: 'demo-healthy',
+        terminal_width: 170,
         model: { id: 'gemini-4-neon', display_name: 'Gemini 4 Neon', effort: 'high' },
         context_window: {
           context_window_size: 1_000_000,
           used_tokens: 174_000,
           used_percentage: 17.4,
           current_usage: { input_tokens: 1_800, cache_read_input_tokens: 172_200 },
-          total_input_tokens: 240_000,
-          total_output_tokens: 44_000,
         },
         quota: {
-          'gemini-5h': { remaining_fraction: 0.79, reset_in_seconds: 4800 },
+          'gemini-5h': { remaining_fraction: 0.79, reset_in_seconds: 11_880 },
           'gemini-weekly': { remaining_fraction: 0.73, reset_in_seconds: 457_200 },
         },
+        agent_state: 'working',
         workspace: { current_dir: '/workspace/agy-hub-pro' },
         _mockGit: { branch: 'main', dirty: false, staged: 0, modified: 0, untracked: 0, ahead: 0, behind: 0, timedOut: false },
+        _mockSessionNetTokens: 1_400_000,
+        _mockTranscriptAction: { label: 'run_command', stepKey: '12:run_command' },
         email: 'dev@example.com',
         plan_tier: 'Google AI Pro',
         cycle_mode: 'auto',
@@ -1279,14 +1758,30 @@ function runTestPreview() {
         version: 1,
         quota: { remaining5h: 79, remainingWeek: 73, isEstimated: false, source: 'agy-stdin' },
         usage: { tokens5h: 284_000, tokensWeek: 1_420_000 },
+        windowActivity: {
+          [winId]: {
+            windowId: winId,
+            sessionId: 'demo-healthy',
+            isWorking: true,
+            workStartAt: now - 18_000,
+            lastProgressAt: now - 2_000,
+            lastOutTokens: 4200,
+            lastOutAt: now - 2_000,
+            lastTps: 56,
+            lastTpsAt: now - 2_000,
+            lastStepKey: '12:run_command',
+            updatedAt: now,
+          },
+        },
         conversations: {},
-        ledger: [{ ts: now - 600_000, tokens: 284_000 }, { ts: now - 86_400_000, tokens: 1_136_000 }],
+        ledger: [],
       },
     },
     {
-      title: '2. Warning (>80% consumed · Yellow · Dirty Git + Sync · Fast Burn ⚡快)',
+      title: '2. Warning (>80% · Yellow · Dirty Git + Sync · Fast Burn ⚡快)',
       payload: {
-        terminal_width: 160,
+        session_id: 'demo-warn',
+        terminal_width: 170,
         model: { id: 'gemini-4-neon', display_name: 'Gemini 4 Neon', effort: 'xhigh' },
         context_window: {
           context_window_size: 1_000_000,
@@ -1298,8 +1793,11 @@ function runTestPreview() {
           'gemini-5h': { remaining_fraction: 0.18, reset_in_seconds: 12_600 },
           'gemini-weekly': { remaining_fraction: 0.16, reset_in_seconds: 172_800 },
         },
+        agent_state: 'idle',
+        tokens_per_second: 84,
         workspace: { current_dir: '/workspace/agy-hub-pro' },
         _mockGit: { branch: 'feat/hud-v2', dirty: true, staged: 2, modified: 3, untracked: 1, ahead: 2, behind: 0, timedOut: false },
+        _mockSessionNetTokens: 312_000,
         email: 'dev@example.com',
         plan_tier: 'Google AI Ultra',
         cycle_mode: 'accept-edits',
@@ -1310,12 +1808,13 @@ function runTestPreview() {
         quota: { remaining5h: 18, remainingWeek: 16, isEstimated: false, source: 'agy-stdin' },
         usage: { tokens5h: 4_120_000, tokensWeek: 33_600_000 },
         conversations: {},
-        ledger: [{ ts: now - 900_000, tokens: 4_120_000 }, { ts: now - 172_800_000, tokens: 29_480_000 }],
+        ledger: [],
       },
     },
     {
-      title: '3. Critical (>90% consumed · Red · Local Estimate ~ · Narrow Width=92)',
+      title: '3. Critical (>90% · Red · Local Estimate ~ · Narrow Width=92)',
       payload: {
+        session_id: 'demo-crit',
         terminal_width: 92,
         model: { id: 'gemini-4-hydrogen', display_name: 'Gemini 4 Hydrogen', effort: 'low' },
         context_window: {
@@ -1326,6 +1825,7 @@ function runTestPreview() {
         },
         workspace: { current_dir: '/tmp' },
         _mockGit: null,
+        _mockSessionNetTokens: 980_000,
         email: 'dev@example.com',
         plan_tier: 'Google AI Pro',
         cycle_mode: 'plan',
@@ -1336,7 +1836,7 @@ function runTestPreview() {
         quota: { remaining5h: 7, remainingWeek: 6, isEstimated: true, source: 'estimated' },
         usage: { tokens5h: 4_650_000, tokensWeek: 37_600_000 },
         conversations: {},
-        ledger: [{ ts: now - 300_000, tokens: 4_650_000 }, { ts: now - 86_400_000, tokens: 32_950_000 }],
+        ledger: [],
       },
     },
   ];
@@ -1632,7 +2132,7 @@ function runDoctor(asJson = false) {
           `Both "agy-hub-pro" and legacy "agy-hud-pro" exist in ${globalHooksPath} (duplicate hooks)`,
           `Run \`${path.join(PLUGIN_DIR, 'install.sh')} --install\` to clean up the legacy entry.`
         );
-        hooksRegistered = null; // already recorded
+        hooksRegistered = null;
       }
     }
   }
@@ -1664,7 +2164,7 @@ function runDoctor(asJson = false) {
     fs.unlinkSync(probeFile);
     if (content !== 'ok') throw new Error('Readback mismatch');
 
-    let extra = RESOLVED_DATA.isFallback
+    const extra = RESOLVED_DATA.isFallback
       ? ` (fallback tmpdir; ${DEFAULT_DATA_DIR} not writable)`
       : '';
     if (fs.existsSync(STATE_FILE)) {
@@ -1710,7 +2210,6 @@ function runDoctor(asJson = false) {
     );
   }
 
-  // Check for stale collector.lock
   if (fs.existsSync(LOCK_FILE)) {
     try {
       const ageSec = Math.round((Date.now() - fs.statSync(LOCK_FILE).mtimeMs) / 1000);
@@ -1798,6 +2297,7 @@ function printHelp() {
       `  AGY_HUB_DOT_STYLE       bullseye | pill | small | square | diamond | classic\n` +
       `  AGY_HUB_DATA_DIR        Override data directory (default: ~/.gemini/plugins/agy-hub-pro/data)\n` +
       `  AGY_HUB_GIT_TIMEOUT_MS  Git status timeout in ms (default: 150)\n` +
+      `  AGY_HUB_STALL_SEC       Seconds without progress before live dot turns yellow (default: 60)\n` +
       `  AGY_HUB_SHOW_NON_GIT    Set to 1 to show git:- outside Git repositories\n` +
       `  NO_COLOR                Set to any non-empty value to disable ANSI colors\n`
   );

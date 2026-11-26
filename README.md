@@ -1,16 +1,20 @@
 # agy-hub-pro (AGY Hub Pro)
 
-**English** | [简体中文](./README_CN.md)
+[![Release](https://img.shields.io/github/v/release/bangbangda/agy-hub-pro?style=flat-square&color=blue)](https://github.com/bangbangda/agy-hub-pro/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/bangbangda/agy-hub-pro/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/bangbangda/agy-hub-pro/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)](#privacy--security)
+[![Node.js >= 18 ESM](https://img.shields.io/badge/node-%3E%3D18%20ESM-339933?style=flat-square&logo=node.js&logoColor=white)](#10-second-quick-install)
 
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)](#privacy--security)
-[![Node.js >= 18](https://img.shields.io/badge/node-%3E%3D18%20ESM-blue)](#10-second-quick-install)
-[![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](#project-structure)
+**English** | [简体中文](./README_CN.md)
 
 A lightweight, **zero-dependency**, self-contained **Antigravity CLI (`agy`)** two-line StatusLine HUD and lifecycle hooks plugin built purely on native Node.js ESM (`node:*`). Millisecond synchronous rendering, safe non-destructive config merging, and zero terminal input lag.
 
+![AGY Hub Pro Terminal Preview](./assets/preview.png)
+
 ```text
-agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (284K tok · 1h20m) │ Wk: ◉◉◉◉○ 73% (1.4M tok · 5d7h)
-[Gemini 4 Neon · High] │ User: dev@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF
+agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Tok: 1.4M │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (3h18m) │ Wk: ◉◉◉◉○ 73% (5d7h)
+[Gemini 4 Neon · High] │ User: dev@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ ● run_command 18s · ~56 t/s
 ```
 
 ---
@@ -75,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/bangbangda/agy-hub-pro/main/uninsta
 
 AGY Hub Pro renders two compact lines that automatically trim lower-priority fields when `terminal_width` narrows so split panes never wrap awkwardly.
 
-### Line 1 — Workspace, Git, Context, Cache & Quota Ledger
+### Line 1 — Workspace, Git, Context, Net Tokens, Cache & Quota
 
 | Segment | Example | Meaning |
 | :--- | :--- | :--- |
@@ -83,13 +87,14 @@ AGY Hub Pro renders two compact lines that automatically trim lower-priority fie
 | **Git Sync Arrows** | `↑2↓1` | Commits ahead (`↑` cyan) / behind (`↓` magenta) upstream tracking branch. |
 | **Git Dirty Breakdown** | `(+2 ~3 ?1)` | `+N` staged (green), `~N` modified (yellow), `?N` untracked (dim). Shows `…` if `git status` timed out and fell back to direct `.git/HEAD` read. |
 | **Context Window** | `Ctx: ◉○○○○ 17.4% (174K/1M)` | 5-dot progress bar + used percentage + compact `used/max` tokens. |
+| **Session Net Tokens** | `Tok: 1.4M` | Exact incremental current-session `input + output` tokens from `transcript.jsonl` (excludes cache reads). |
 | **Prompt Cache** | `Cache: 99%` | Prompt cache read hit ratio. Green `≥70%`, Yellow `40–69%`, Red `<40%`. |
-| **5-Hour Quota** | `5h: ◉◉◉◉○ 79% (284K tok · 1h20m)` | Remaining 5h quota % + tokens consumed in active 5h cycle + reset countdown. |
+| **5-Hour Quota** | `5h: ◉◉◉◉○ 79% (3h18m)` | Remaining 5h quota % + reset countdown. |
 | **Fast-Burn Warning** | `⚡快` | Shown inside `5h` when remaining `<70%` and burn rate exceeds `1.25×` elapsed time in the 5h window. |
-| **Weekly Quota** | `Wk: ◉◉◉◉○ 73% (1.4M tok · 5d7h)` | Remaining weekly quota % + tokens consumed in active 7-day quota cycle + reset countdown. |
+| **Weekly Quota** | `Wk: ◉◉◉◉○ 73% (5d7h)` | Remaining weekly quota % + reset countdown. |
 | **Local Estimate Prefix** | `~92%` | Tilde `~` indicates quota is estimated locally from the 7-day token ledger when live cloud quota is absent. |
 
-### Line 2 — Model, Account, Plan, Mode & Sandbox
+### Line 2 — Model, Account, Plan, Mode, Sandbox & Live Activity
 
 | Segment | Example | Meaning |
 | :--- | :--- | :--- |
@@ -98,6 +103,7 @@ AGY Hub Pro renders two compact lines that automatically trim lower-priority fie
 | **Plan Tier** | `Plan: Google AI Pro` | Subscription tier colored by level (Ultra/Max yellow, Pro/Team cyan, Free gray). |
 | **Execution Mode** | `Mode: auto` | Active execution mode (`auto` green, `plan` cyan, `accept-edits` yellow). |
 | **Sandbox** | `Sandbox: OFF` | Terminal sandbox status (`ON` green, `OFF` yellow). |
+| **Live Activity & Speed** | `● run_command 18s · ~56 t/s` | Active status dot (green while progressing, yellow after `60s` stall), current tool/thinking label, elapsed timer, and output throughput (`~t/s` persists per terminal window across `/clear`). |
 
 ### 5-Dot Threshold Colors & Styles
 
@@ -172,6 +178,7 @@ All `AGY_HUB_*` variables also accept legacy `AGY_HUD_*` aliases for backward co
 | `AGY_HUB_DOT_STYLE` | `bullseye` | Glyph style: `bullseye` / `pill` / `small` / `square` / `diamond` / `classic` |
 | `AGY_HUB_DATA_DIR` | `~/.gemini/plugins/agy-hub-pro/data` | Override local state, lock & stdin snapshot directory |
 | `AGY_HUB_GIT_TIMEOUT_MS` | `150` | Timeout in ms for `git status` (falls back to `.git/HEAD` read on timeout) |
+| `AGY_HUB_STALL_SEC` | `60` | Seconds without token or transcript step progress before live indicator turns yellow |
 | `AGY_HUB_SHOW_NON_GIT` | `0` | Set to `1` to display `(git:-)` outside Git repositories |
 | `AGY_HUB_WARN_THRESHOLD` | `15` | Remaining quota % threshold for `PreInvocation` low-quota warnings |
 | `AGY_HUB_5H_BUDGET` | `5000000` | Fallback 5-hour token budget for local estimation (`~` prefix) |
@@ -188,11 +195,17 @@ agy-hub-pro/
 ├── plugin.json       # Native Antigravity plugin manifest
 ├── hooks.json        # Root lifecycle hooks (SessionStart / PreInvocation / Stop)
 ├── assets/
-│   └── logo.svg      # Vector plugin icon
+│   ├── logo.svg      # Vector plugin icon
+│   └── preview.png   # Terminal statusline preview image
 ├── statusline.mjs    # Millisecond two-line ANSI StatusLine renderer + --test / --doctor CLI
 ├── collector.mjs     # Detached background quota prober & 7-day token ledger maintainer
 ├── install.sh        # Remote/local installer with safe deep-merge, backup & test suite
 ├── uninstall.sh      # Clean uninstaller preserving all other user configurations
+├── LICENSE           # MIT License
 ├── README.md         # English documentation
 └── README_CN.md      # Chinese documentation
 ```
+
+## License
+
+This project is licensed under the [MIT License](./LICENSE).

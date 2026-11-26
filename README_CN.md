@@ -1,16 +1,20 @@
 # agy-hub-pro (AGY Hub Pro)
 
-[English](./README.md) | **简体中文**
+[![Release](https://img.shields.io/github/v/release/bangbangda/agy-hub-pro?style=flat-square&color=blue)](https://github.com/bangbangda/agy-hub-pro/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/bangbangda/agy-hub-pro/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/bangbangda/agy-hub-pro/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](./LICENSE)
+[![零依赖](https://img.shields.io/badge/dependencies-%E9%9B%B6%E4%BE%9D%E8%B5%96-brightgreen?style=flat-square)](#隐私与安全声明)
+[![Node.js >= 18 ESM](https://img.shields.io/badge/node-%3E%3D18%20ESM-339933?style=flat-square&logo=node.js&logoColor=white)](#10-秒极速安装)
 
-[![零依赖](https://img.shields.io/badge/dependencies-%E9%9B%B6%E4%BE%9D%E8%B5%96-brightgreen)](#隐私与安全声明)
-[![Node.js >= 18](https://img.shields.io/badge/node-%3E%3D18%20ESM-blue)](#10-秒极速安装)
-[![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](#项目结构)
+[English](./README.md) | **简体中文**
 
 轻量级、**零外部依赖**、自包含的 **Antigravity CLI (`agy`)** 双行底部状态栏（StatusLine HUD）与生命周期钩子插件。基于原生 Node.js ESM（仅使用 `node:*` 内置模块）构建，毫秒级同步渲染、无损深度合并配置、终端输入零卡顿。
 
+![AGY Hub Pro 终端效果预览](./assets/preview.png)
+
 ```text
-agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (284K tok · 1h20m) │ Wk: ◉◉◉◉○ 73% (1.4M tok · 5d7h)
-[Gemini 4 Neon · High] │ User: dev@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF
+agy-hub-pro (git:main✓) │ Ctx: ◉○○○○ 17.4% (174K/1M) │ Tok: 1.4M │ Cache: 99% │ 5h: ◉◉◉◉○ 79% (3h18m) │ Wk: ◉◉◉◉○ 73% (5d7h)
+[Gemini 4 Neon · High] │ User: dev@example.com │ Plan: Google AI Pro │ Mode: auto │ Sandbox: OFF │ ● run_command 18s · ~56 t/s
 ```
 
 ---
@@ -75,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/bangbangda/agy-hub-pro/main/uninsta
 
 AGY Hub Pro 采用双行紧凑布局，并根据 `terminal_width` 自动按优先级裁剪次要字段，分屏变窄也不会错位折行。
 
-### 第一行 — 项目目录、Git、上下文、缓存命中与配额账本
+### 第一行 — 项目目录、Git、上下文、净消耗、缓存命中与配额
 
 | 字段 | 示例 | 说明 |
 | :--- | :--- | :--- |
@@ -83,13 +87,14 @@ AGY Hub Pro 采用双行紧凑布局，并根据 `terminal_width` 自动按优�
 | **远程同步箭头** | `↑2↓1` | 领先上游分支提交数（青色 `↑`）与落后提交数（洋红 `↓`）。 |
 | **变更明细** | `(+2 ~3 ?1)` | `+N` 已暂存（绿）、`~N` 已修改（黄）、`?N` 未跟踪（灰）。若大仓库 `git status` 超时，自动回退直读 `.git/HEAD` 并显示 `…`。 |
 | **Context 窗口** | `Ctx: ◉○○○○ 17.4% (174K/1M)` | 5 格进度条 + 上下文已用百分比 + `已用/上限` Token 紧凑计数。 |
+| **当前会话净消耗** | `Tok: 1.4M` | 基于 `transcript.jsonl` 精确增量统计的当前会话净消耗（`input + output`，不含缓存读取）。 |
 | **Prompt Cache** | `Cache: 99%` | 本轮 Prompt Cache 缓存命中率。`≥70%` 绿、`40–69%` 黄、`<40%` 红。 |
-| **5 小时滚动配额** | `5h: ◉◉◉◉○ 79% (284K tok · 1h20m)` | 5h 剩余配额百分比 + 当前 5h 周期累计消耗 Token + 重置倒计时。 |
+| **5 小时滚动配额** | `5h: ◉◉◉◉○ 79% (3h18m)` | 5h 剩余配额百分比 + 重置倒计时。 |
 | **快速消耗预警** | `⚡快` | 当 5h 余量 `<70%` 且消耗速率超过当前窗口流逝进度的 `1.25×` 时自动点亮。 |
-| **周配额窗口** | `Wk: ◉◉◉◉○ 73% (1.4M tok · 5d7h)` | 周剩余配额百分比 + 当前云端周重置周期累计 Token + 重置倒计时。 |
+| **周配额窗口** | `Wk: ◉◉◉◉○ 73% (5d7h)` | 周剩余配额百分比 + 重置倒计时。 |
 | **本地估算标记** | `~92%` | 当无云端实时配额数据时，自动基于本地 7 天 Token 账本推算余量并加 `~` 前缀提示。 |
 
-### 第二行 — 模型、思考强度、账号、套餐与运行模式
+### 第二行 — 模型、思考强度、账号、套餐、模式与实时活跃状态
 
 | 字段 | 示例 | 说明 |
 | :--- | :--- | :--- |
@@ -98,6 +103,7 @@ AGY Hub Pro 采用双行紧凑布局，并根据 `terminal_width` 自动按优�
 | **订阅套餐** | `Plan: Google AI Pro` | 订阅等级按颜色区分（Ultra/Max 黄色、Pro/Team 青色、Free 灰色）。 |
 | **执行模式** | `Mode: auto` | 当前代理执行模式（`auto` 绿、`plan` 青、`accept-edits` 黄）。 |
 | **沙箱状态** | `Sandbox: OFF` | 终端沙箱开启状态（`ON` 绿、`OFF` 黄）。 |
+| **实时状态与速率** | `● run_command 18s · ~56 t/s` | 工作态实时圆点（正常绿、超过 `60s` 无进展变黄提示卡顿）、当前工具动作/思考中、耗时计时与输出吞吐速率（同一终端窗口内跨 `/clear` 持久保留）。 |
 
 ### 5 格进度条三色阈值与内置样式
 
@@ -172,6 +178,7 @@ node ~/.gemini/plugins/agy-hub-pro/statusline.mjs --doctor --json
 | `AGY_HUB_DOT_STYLE` | `bullseye` | 进度样式：`bullseye` / `pill` / `small` / `square` / `diamond` / `classic` |
 | `AGY_HUB_DATA_DIR` | `~/.gemini/plugins/agy-hub-pro/data` | 自定义状态账本、锁文件与嗅探快照存储目录 |
 | `AGY_HUB_GIT_TIMEOUT_MS` | `150` | `git status` 超时阈值（毫秒），超时后自动回退读取 `.git/HEAD` |
+| `AGY_HUB_STALL_SEC` | `60` | 无 Token 增长或步骤推进超过该秒数时，活跃圆点变黄提示卡顿 |
 | `AGY_HUB_SHOW_NON_GIT` | `0` | 设为 `1` 时在非 Git 目录显示 `(git:-)` |
 | `AGY_HUB_WARN_THRESHOLD` | `15` | `PreInvocation` 主动配额预警阈值（%） |
 | `AGY_HUB_5H_BUDGET` | `5000000` | 无云端配额时的 5h 本地估算基准（tokens） |
@@ -188,11 +195,17 @@ agy-hub-pro/
 ├── plugin.json       # Antigravity 原生插件清单
 ├── hooks.json        # 根目录生命周期钩子 (SessionStart / PreInvocation / Stop)
 ├── assets/
-│   └── logo.svg      # 插件矢量图标
+│   ├── logo.svg      # 插件矢量图标
+│   └── preview.png   # 终端状态栏效果预览图
 ├── statusline.mjs    # 毫秒级双行 ANSI 状态栏渲染器 + --test / --doctor 自检入口
 ├── collector.mjs     # 后台异步配额探测与 7 天本地 Token 账本维护脚本
 ├── install.sh        # 远程/本地一键安装器（自动探测、安全深合并、时间戳备份与测试套件）
 ├── uninstall.sh      # 一键无残留卸载脚本（保留所有其他用户配置）
+├── LICENSE           # MIT 开源许可证
 ├── README.md         # 英文主文档
 └── README_CN.md      # 简体中文文档
 ```
+
+## 开源协议
+
+本项目基于 [MIT License](./LICENSE) 开源。

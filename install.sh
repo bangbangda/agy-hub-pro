@@ -286,8 +286,6 @@ NODE_EOF
     log_warn "Skipping agy plugin install; merging lifecycle hooks into ${global_hooks_file}..."
   fi
 
-  # If native plugin install succeeded, still clean up any legacy agy-hud-pro entry in global hooks.json
-  # to prevent duplicate hook execution; otherwise deep-merge agy-hub-pro into global hooks.json.
   node - "${global_hooks_file}" "${COLLECTOR_SCRIPT}" "${ts}" "${plugin_installed}" <<'NODE_EOF'
 const fs = require('node:fs');
 const path = require('node:path');
@@ -321,7 +319,6 @@ if (hadFile) {
 }
 
 if (pluginInstalled) {
-  // Only touch global hooks.json if stale legacy entry exists
   if (existing['agy-hud-pro'] || existing['agy-hub-pro']) {
     const backupPath = `${realHooksPath}.bak.${ts}`;
     fs.copyFileSync(realHooksPath, backupPath);
@@ -342,7 +339,6 @@ if (hadFile) {
   console.log(`BACKUP:${backupPath}`);
 }
 
-// Clean up legacy key if upgrading from agy-hud-pro
 delete existing['agy-hud-pro'];
 
 const merged = {
@@ -371,7 +367,6 @@ NODE_EOF
     log_ok "Deep-merged lifecycle hooks into ${global_hooks_file}"
   fi
 
-  # Ensure data directory exists
   local data_dir="${AGY_HUB_DATA_DIR:-${HOME}/.gemini/plugins/agy-hub-pro/data}"
   mkdir -p "${data_dir}" 2>/dev/null || true
 
@@ -470,7 +465,6 @@ NODE_EOF
     agy plugin uninstall agy-hud-pro >/dev/null 2>&1 && log_ok "Removed legacy plugin: agy-hud-pro" || true
   fi
 
-  # Remove runtime data/cache directory
   local data_dir="${AGY_HUB_DATA_DIR:-${HOME}/.gemini/plugins/agy-hub-pro/data}"
   if [[ -d "${data_dir}" ]]; then
     rm -rf "${data_dir}"
@@ -649,7 +643,10 @@ const [stateFile, expectedReset, rendered] = process.argv.slice(2);
 const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
 if (st.usage.tokensWeek !== 500_000) { console.error(`FAIL 8a: tokensWeek=${st.usage.tokensWeek}`); process.exit(1); }
 if (st.quota.resetWeekTime !== expectedReset) { console.error(`FAIL 8a: resetWeekTime=${st.quota.resetWeekTime}`); process.exit(1); }
-if (!rendered.includes('500K tok')) { console.error(`FAIL 8a: rendered missing 500K tok`); process.exit(1); }
+if (rendered.includes('tok ·') || /\b\d+(?:\.\d+)?[KMB]?\s*tok\b/i.test(rendered)) {
+  console.error(`FAIL 8a: expected 5h/Wk output to omit inaccurate tok counts, got:\n${rendered}`);
+  process.exit(1);
+}
 NODE_EOF
 
   printf '{"conversationId":"conv-curr-cycle","modelName":"gemini-4-neon","terminationReason":"NO_TOOL_CALL"}\n' \
@@ -688,7 +685,121 @@ if (!st.quota.resetWeekTime || !Number.isFinite(Date.parse(st.quota.resetWeekTim
 NODE_EOF
   log_ok "Weekly quota cycle alignment verified"
 
-  log_header "9. Verify safe Deep Merge, Symlink preservation, --doctor PASS, & Clean Uninstall"
+  log_header "9. Verify live activity, tool action, stall warning, /clear persistence & window isolation"
+  local act_state="${tmp_dir}/state-activity.json"
+  local act_transcript="${tmp_dir}/transcript.jsonl"
+  printf '{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"hello"}\n' > "${act_transcript}"
+
+  local rendered_act1
+  rendered_act1="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1000},"agent_state":"working","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
+    | NO_COLOR=1 AGY_HUB_WINDOW_ID="win-main" AGY_HUB_STATE_FILE="${act_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_act1}" <<'NODE_EOF'
+if (!process.argv[2].includes('● 思考中')) { console.error(`FAIL 9a: expected "● 思考中", got:\n${process.argv[2]}`); process.exit(1); }
+NODE_EOF
+
+  printf '{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command"}]}\n' >> "${act_transcript}"
+  node - "${act_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const t10 = Date.now() - 10_000;
+const act = st.windowActivity['win-main'];
+act.workStartAt = t10;
+act.lastOutAt = t10;
+act.lastProgressAt = t10;
+fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
+NODE_EOF
+  local rendered_act2
+  rendered_act2="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1560},"agent_state":"working","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
+    | NO_COLOR=1 AGY_HUB_WINDOW_ID="win-main" AGY_HUB_STATE_FILE="${act_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_act2}" <<'NODE_EOF'
+if (!process.argv[2].includes('● run_command 10s · ~56 t/s')) { console.error(`FAIL 9b: expected "● run_command 10s · ~56 t/s", got:\n${process.argv[2]}`); process.exit(1); }
+NODE_EOF
+
+  node - "${act_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const t75 = Date.now() - 75_000;
+const act = st.windowActivity['win-main'];
+act.workStartAt = t75;
+act.lastProgressAt = t75;
+fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
+NODE_EOF
+  local rendered_act3
+  rendered_act3="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1560},"agent_state":"working","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
+    | AGY_HUB_WINDOW_ID="win-main" AGY_HUB_STATE_FILE="${act_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_act3}" <<'NODE_EOF'
+if (!process.argv[2].includes('\x1b[33m●') || !process.argv[2].includes('1m15s')) { console.error(`FAIL 9c: expected yellow stall dot & 1m15s`); process.exit(1); }
+NODE_EOF
+
+  node - "${act_state}" <<'NODE_EOF'
+const fs = require('node:fs');
+const st = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+st.windowActivity['win-main'].lastTpsAt = Date.now() - 2 * 3600 * 1000;
+fs.writeFileSync(process.argv[2], JSON.stringify(st, null, 2));
+NODE_EOF
+  local rendered_act4
+  rendered_act4="$(printf '{"session_id":"sess-act","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":12,"total_output_tokens":1560},"agent_state":"idle","transcript_path":"%s","cwd":"/tmp"}\n' "${act_transcript}" \
+    | NO_COLOR=1 AGY_HUB_WINDOW_ID="win-main" AGY_HUB_STATE_FILE="${act_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_act4}" <<'NODE_EOF'
+if (process.argv[2].includes('●') || !process.argv[2].includes('~56 t/s')) { console.error(`FAIL 9d: expected persistent idle "~56 t/s"`); process.exit(1); }
+NODE_EOF
+
+  local rendered_act6
+  rendered_act6="$(printf '{"session_id":"sess-after-clear","model":{"id":"gemini-4-neon","display_name":"Gemini 4 Neon (High)","effort":"high"},"context_window":{"context_window_size":1000000,"used_percentage":0,"total_output_tokens":0},"agent_state":"idle","cwd":"/tmp"}\n' \
+    | NO_COLOR=1 AGY_HUB_WINDOW_ID="win-main" AGY_HUB_STATE_FILE="${act_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${act_state}" "${rendered_act6}" <<'NODE_EOF'
+const fs = require('node:fs');
+const [stateFile, rendered] = process.argv.slice(2);
+const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+if (!rendered.includes('~56 t/s') || st.windowActivity['win-main'].lastOutTokens !== 0) { console.error(`FAIL 9e: /clear persistence check failed`); process.exit(1); }
+NODE_EOF
+
+  local rendered_act7
+  rendered_act7="$(printf '{"session_id":"sess-other-win","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":5,"total_output_tokens":0},"agent_state":"idle","cwd":"/tmp"}\n' \
+    | NO_COLOR=1 AGY_HUB_WINDOW_ID="win-other" AGY_HUB_STATE_FILE="${act_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_act7}" <<'NODE_EOF'
+if (process.argv[2].includes('t/s')) { console.error(`FAIL 9f: window isolation failed`); process.exit(1); }
+NODE_EOF
+
+  local rendered_act8
+  rendered_act8="$(printf '{"session_id":"sess-after-clear","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":12},"agent_state":"idle","tokens_per_second":84,"cwd":"/tmp"}\n' \
+    | NO_COLOR=1 AGY_HUB_WINDOW_ID="win-main" AGY_HUB_STATE_FILE="${act_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/act-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_act8}" <<'NODE_EOF'
+if (!process.argv[2].includes('84 t/s') || process.argv[2].includes('~84 t/s')) { console.error(`FAIL 9g: native t/s check failed`); process.exit(1); }
+NODE_EOF
+  log_ok "Live activity, stall detection, /clear persistence & window isolation verified"
+
+  log_header "10. Verify exact incremental session net tokens (Ctx -> Tok -> Cache, excluding cache_read)"
+  local tok_state="${tmp_dir}/state-session-tok.json"
+  local tok_transcript="${tmp_dir}/transcript-session-tok.jsonl"
+  printf '{"step_index":1,"type":"USER_INPUT","status":"DONE","content":"hi"}\n' > "${tok_transcript}"
+  printf '{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":12000,"cache_read_tokens":500000,"output_tokens":3000}\n' >> "${tok_transcript}"
+  printf '{"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":8000,"cache_read_tokens":600000,"output_tokens":2000}\n' >> "${tok_transcript}"
+
+  local rendered_tok1
+  rendered_tok1="$(printf '{"session_id":"sess-tok","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":15,"current_usage":{"input_tokens":2000,"cache_read_input_tokens":98000}},"quota":{"gemini-5h":{"remaining_fraction":0.8,"reset_in_seconds":7200},"gemini-weekly":{"remaining_fraction":0.75,"reset_in_seconds":345600}},"transcript_path":"%s","cwd":"/tmp"}\n' "${tok_transcript}" \
+    | NO_COLOR=1 AGY_HUB_STATE_FILE="${tok_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/tok-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_tok1}" <<'NODE_EOF'
+const line1 = (process.argv[2].split('\n')[0] || '');
+const idxCtx = line1.indexOf('Ctx:');
+const idxTok = line1.indexOf('Tok: 25K');
+const idxCache = line1.indexOf('Cache: 98%');
+if (idxCtx < 0 || idxTok < 0 || idxCache < 0 || !(idxCtx < idxTok && idxTok < idxCache)) {
+  console.error(`FAIL 10a: expected Ctx < Tok: 25K < Cache: 98%, got:\n${line1}`);
+  process.exit(1);
+}
+NODE_EOF
+
+  printf '{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":60000,"cache_read_tokens":900000,"output_tokens":15000}\n' >> "${tok_transcript}"
+  local rendered_tok2
+  rendered_tok2="$(printf '{"session_id":"sess-tok","model":{"id":"gemini-4-neon"},"context_window":{"context_window_size":1000000,"used_percentage":15,"current_usage":{"input_tokens":2000,"cache_read_input_tokens":98000}},"transcript_path":"%s","cwd":"/tmp"}\n' "${tok_transcript}" \
+    | NO_COLOR=1 AGY_HUB_STATE_FILE="${tok_state}" AGY_HUB_LAST_STDIN="${tmp_dir}/tok-stdin.json" node "${STATUSLINE_SCRIPT}")"
+  node - "${rendered_tok2}" <<'NODE_EOF'
+if (!process.argv[2].includes('Tok: 100K')) { console.error(`FAIL 10b: expected Tok: 100K`); process.exit(1); }
+NODE_EOF
+  log_ok "Exact session net token tracking verified (25K -> 100K)"
+
+  log_header "11. Verify safe Deep Merge, Symlink preservation, --doctor PASS, & Clean Uninstall"
   local mock_cfg_dir="${tmp_dir}/cfg"
   local real_settings="${mock_cfg_dir}/real-settings.json"
   local link_settings="${mock_cfg_dir}/settings.json"
@@ -721,7 +832,6 @@ EOF
 }
 EOF
 
-  # Run install against isolated mock symlinked settings + hooks
   AGY_HUB_SETTINGS_FILE="${link_settings}" \
   AGY_HUB_HOOKS_FILE="${mock_hooks}" \
   AGY_HUB_DATA_DIR="${mock_data}" \
@@ -733,43 +843,35 @@ const fs = require('node:fs');
 const path = require('node:path');
 const [linkSettings, realSettings, hooksPath, statuslineScript] = process.argv.slice(2);
 
-if (!fs.lstatSync(linkSettings).isSymbolicLink()) {
-  console.error('FAIL 9a: Symlink settings.json was destroyed!');
-  process.exit(1);
-}
+if (!fs.lstatSync(linkSettings).isSymbolicLink()) { console.error('FAIL 11a: Symlink destroyed'); process.exit(1); }
 const backups = fs.readdirSync(path.dirname(realSettings)).filter((f) => /^real-settings\.json\.bak\.\d{14}$/.test(f));
-if (backups.length < 1) {
-  console.error('FAIL 9b: Timestamped backup was not created!');
-  process.exit(1);
-}
+if (backups.length < 1) { console.error('FAIL 11b: Missing timestamped backup'); process.exit(1); }
 const cfg = JSON.parse(fs.readFileSync(realSettings, 'utf8'));
 if (cfg.model !== 'gemini-4-neon' || cfg.mcpServers?.['my-custom-mcp']?.command !== 'npx' || cfg.trustedWorkspaces?.[0] !== '/Users/example/project' || cfg.permissions?.allow?.[0] !== 'Read') {
-  console.error('FAIL 9c: Existing user settings were not preserved!', cfg);
+  console.error('FAIL 11c: Existing user settings not preserved');
   process.exit(1);
 }
 if (!cfg.statusLine || cfg.statusLine.command !== `node ${statuslineScript}` || cfg.statusLine.enabled !== true) {
-  console.error('FAIL 9d: statusLine was not properly merged!', cfg.statusLine);
+  console.error('FAIL 11d: statusLine merge failed');
   process.exit(1);
 }
 const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
 if (!hooks['user-custom-hook'] || !hooks['agy-hub-pro'] || hooks['agy-hud-pro']) {
-  console.error('FAIL 9e: hooks.json merge / legacy cleanup failed!', hooks);
+  console.error('FAIL 11e: hooks.json merge / legacy cleanup failed');
   process.exit(1);
 }
 NODE_EOF
   log_ok "Deep merge preserved mcpServers/trustedWorkspaces/permissions/model, kept symlink & created timestamped backup"
 
-  # Run --doctor against the mounted isolated config — must exit 0 with 0 failures!
   AGY_HUB_SETTINGS_FILE="${link_settings}" \
   AGY_HUB_HOOKS_FILE="${mock_hooks}" \
   AGY_HUB_DATA_DIR="${mock_data}" \
     node "${STATUSLINE_SCRIPT}" --doctor --json | node -e '
       const res = JSON.parse(require("fs").readFileSync(0, "utf8"));
-      if (!res.ok || res.failures !== 0) { console.error("FAIL 9f: --doctor reported failures:", res); process.exit(1); }
+      if (!res.ok || res.failures !== 0) { console.error("FAIL 11f: --doctor reported failures:", res); process.exit(1); }
     '
   log_ok "statusline.mjs --doctor passed with 0 failures against mounted symlinked config"
 
-  # Run uninstall against isolated config
   AGY_HUB_SETTINGS_FILE="${link_settings}" \
   AGY_HUB_HOOKS_FILE="${mock_hooks}" \
   AGY_HUB_DATA_DIR="${mock_data}" \
@@ -780,29 +882,26 @@ NODE_EOF
 const fs = require('node:fs');
 const [realSettings, hooksPath] = process.argv.slice(2);
 const cfg = JSON.parse(fs.readFileSync(realSettings, 'utf8'));
-if (cfg.statusLine !== undefined) {
-  console.error('FAIL 9g: statusLine was not removed on uninstall!');
-  process.exit(1);
-}
+if (cfg.statusLine !== undefined) { console.error('FAIL 11g: statusLine not removed'); process.exit(1); }
 if (cfg.model !== 'gemini-4-neon' || cfg.mcpServers?.['my-custom-mcp']?.command !== 'npx' || cfg.permissions?.allow?.[0] !== 'Read') {
-  console.error('FAIL 9h: User settings damaged during uninstall!');
+  console.error('FAIL 11h: User settings damaged during uninstall');
   process.exit(1);
 }
 const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
 if (!hooks['user-custom-hook'] || hooks['agy-hub-pro'] || hooks['agy-hud-pro']) {
-  console.error('FAIL 9i: hooks.json uninstall failed!', hooks);
+  console.error('FAIL 11i: hooks.json uninstall failed');
   process.exit(1);
 }
 NODE_EOF
   log_ok "Clean uninstall removed only agy-hub-pro entries and preserved all user configs"
 
-  log_header "10. Verify stdin field sniffing snapshot"
+  log_header "12. Verify stdin field sniffing snapshot"
   if [[ -f "${test_stdin_dump}" ]]; then
     log_ok "Generated ${test_stdin_dump} (first 6 lines):"
     head -n 6 "${test_stdin_dump}" | sed 's/^/  /'
   fi
 
-  printf "\n${BOLD}${GREEN}✔ All simulation, deep-merge, doctor, and uninstall tests passed!${RESET}\n"
+  printf "\n${BOLD}${GREEN}✔ All simulation, activity, token, deep-merge, doctor, and uninstall tests passed!${RESET}\n"
 }
 
 print_usage() {

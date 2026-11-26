@@ -1,8 +1,27 @@
 {
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
-  "name": "agy-hud-pro",
-  "displayName": "AGY HUD Pro",
-  "version": "0.1.0",
-  "description": "Lightweight millisecond StatusLine & lifecycle hooks plugin for Antigravity CLI (agy) tracking model context, 5h/weekly quota & token ledger, and Git status.",
-  "author": "horace"
+  "name": "agy-hub-pro",
+  "displayName": "AGY Hub Pro",
+  "version": "1.0.0",
+  "description": "Zero-dependency millisecond StatusLine HUD & lifecycle hooks plugin for Antigravity CLI (agy) tracking context window, cache hit rate, 5h/weekly quota & token ledger, and Git status.",
+  "author": {
+    "name": "bangbangda",
+    "url": "https://github.com/bangbangda"
+  },
+  "homepage": "https://github.com/bangbangda/agy-hub-pro",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bangbangda/agy-hub-pro.git"
+  },
+  "license": "MIT",
+  "logo": "assets/logo.svg",
+  "keywords": [
+    "antigravity",
+    "agy",
+    "statusline",
+    "hud",
+    "hooks",
+    "quota",
+    "telemetry"
+  ]
 }

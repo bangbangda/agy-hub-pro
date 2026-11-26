@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * agy-hud-pro / collector.mjs
+ * agy-hub-pro / collector.mjs
  *
  * Lifecycle Hook Handler & Background Quota / Token Ledger Collector.
- * Zero external dependencies (macOS native Node.js ESM).
+ * Zero external dependencies (native Node.js ESM).
  *
  * Supported invocations:
  *   node collector.mjs --event SessionStart
@@ -21,20 +21,52 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const PLUGIN_DIR = path.dirname(__filename);
 
-const STATE_FILE = process.env.AGY_HUD_STATE_FILE || path.join(PLUGIN_DIR, 'state.json');
-const LOCK_FILE = process.env.AGY_HUD_LOCK_FILE || path.join(PLUGIN_DIR, 'collector.lock');
-const LAST_STDIN_FILE = process.env.AGY_HUD_LAST_STDIN || '/tmp/agy-hud-last-stdin.json';
+const DEFAULT_DATA_DIR = path.join(os.homedir(), '.gemini', 'plugins', 'agy-hub-pro', 'data');
+const FALLBACK_DATA_DIR = path.join(os.tmpdir(), 'agy-hub-pro-data');
+
+function resolveDataDir() {
+  const envDir = process.env.AGY_HUB_DATA_DIR || process.env.AGY_HUD_DATA_DIR;
+  const candidates = envDir ? [envDir, FALLBACK_DATA_DIR] : [DEFAULT_DATA_DIR, FALLBACK_DATA_DIR];
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK);
+      return dir;
+    } catch {
+      // Fall through to next writable directory
+    }
+  }
+  return FALLBACK_DATA_DIR;
+}
+
+const DATA_DIR = resolveDataDir();
+const EXPLICIT_STATE_FILE = process.env.AGY_HUB_STATE_FILE || process.env.AGY_HUD_STATE_FILE || '';
+const STATE_FILE = EXPLICIT_STATE_FILE || path.join(DATA_DIR, 'state.json');
+const LOCK_FILE =
+  process.env.AGY_HUB_LOCK_FILE ||
+  process.env.AGY_HUD_LOCK_FILE ||
+  path.join(DATA_DIR, 'collector.lock');
+const LAST_STDIN_FILE =
+  process.env.AGY_HUB_LAST_STDIN ||
+  process.env.AGY_HUD_LAST_STDIN ||
+  path.join(DATA_DIR, 'last-stdin.json');
 
 const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const WINDOW_DRIFT_TOLERANCE_MS = 5 * 60 * 1000;
 const STALE_LOCK_MS = 30 * 1000;
 const MIN_REFRESH_INTERVAL_MS = 15 * 1000;
-const LOW_QUOTA_THRESHOLD = Number(process.env.AGY_HUD_WARN_THRESHOLD || 15);
+const LOW_QUOTA_THRESHOLD = Number(
+  process.env.AGY_HUB_WARN_THRESHOLD || process.env.AGY_HUD_WARN_THRESHOLD || 15
+);
 
 // Fallback local budget assumptions when live cloud quota cannot be read locally.
-const DEFAULT_5H_BUDGET = Number(process.env.AGY_HUD_5H_BUDGET || 5_000_000);
-const DEFAULT_WEEK_BUDGET = Number(process.env.AGY_HUD_WEEK_BUDGET || 40_000_000);
+const DEFAULT_5H_BUDGET = Number(
+  process.env.AGY_HUB_5H_BUDGET || process.env.AGY_HUD_5H_BUDGET || 5_000_000
+);
+const DEFAULT_WEEK_BUDGET = Number(
+  process.env.AGY_HUB_WEEK_BUDGET || process.env.AGY_HUD_WEEK_BUDGET || 40_000_000
+);
 
 // ---------------------------------------------------------------------------
 // Utility helpers
@@ -169,7 +201,20 @@ function createDefaultState(now = Date.now()) {
 }
 
 function loadState() {
-  const existing = safeReadJson(STATE_FILE);
+  let existing = safeReadJson(STATE_FILE);
+  if (!existing && !EXPLICIT_STATE_FILE) {
+    // One-time seamless migration fallback from legacy state locations
+    const legacyCandidates = [
+      path.join(PLUGIN_DIR, 'state.json'),
+      path.join(os.homedir(), '.gemini', 'plugins', 'agy-hud-pro', 'state.json'),
+    ];
+    for (const legacyPath of legacyCandidates) {
+      if (legacyPath !== STATE_FILE) {
+        existing = safeReadJson(legacyPath);
+        if (existing && typeof existing === 'object') break;
+      }
+    }
+  }
   if (!existing || typeof existing !== 'object') {
     return createDefaultState();
   }
@@ -179,9 +224,10 @@ function loadState() {
     ...existing,
     quota: { ...base.quota, ...(existing.quota || {}) },
     usage: { ...base.usage, ...(existing.usage || {}) },
-    conversations: existing.conversations && typeof existing.conversations === 'object'
-      ? existing.conversations
-      : {},
+    conversations:
+      existing.conversations && typeof existing.conversations === 'object'
+        ? existing.conversations
+        : {},
     ledger: Array.isArray(existing.ledger) ? existing.ledger : [],
   };
 }
@@ -482,7 +528,7 @@ function extractTurnTokens(payload, state) {
     return { deltaTokens: Math.round(payload.deltaTokens), model, convId, source: 'hook-delta' };
   }
 
-  // 2. Compare cumulative session/context_window tokens from payload or /tmp/agy-hud-last-stdin.json
+  // 2. Compare cumulative session/context_window tokens from payload or last-stdin.json
   const ctxObj = payload.context_window || payload.contextWindow || safeReadJson(LAST_STDIN_FILE)?.context_window || null;
   if (ctxObj && typeof ctxObj === 'object') {
     const inTot = Number(ctxObj.total_input_tokens ?? ctxObj.totalInputTokens ?? 0);
@@ -639,7 +685,7 @@ function handlePreInvocation(payload) {
     if (lowWk) reasons.push(`周余量 ${prefix}${remWk}% (${formatTokens(state.usage.tokensWeek)} tok)`);
 
     const notice =
-      `[AGY HUD 配额预警] ${reasons.join('，')}，已低于 ${LOW_QUOTA_THRESHOLD}% 预警阈值。` +
+      `[AGY Hub Pro 配额预警] ${reasons.join('，')}，已低于 ${LOW_QUOTA_THRESHOLD}% 预警阈值。` +
       `建议立即切换至高性价比模型 \`gemini-4-hydrogen\`（可在终端输入 \`/model gemini-4-hydrogen\`）以避免触及限流。`;
 
     // Antigravity PreInvocation contract
